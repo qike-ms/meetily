@@ -73,6 +73,7 @@ pub enum LLMProvider {
     OpenRouter,
     BuiltInAI,
     CustomOpenAI,
+    OpenCode,
 }
 
 impl LLMProvider {
@@ -86,6 +87,7 @@ impl LLMProvider {
             "openrouter" => Ok(Self::OpenRouter),
             "builtin-ai" | "local-llama" | "localllama" => Ok(Self::BuiltInAI),
             "custom-openai" => Ok(Self::CustomOpenAI),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(format!("Unsupported LLM provider: {}", s)),
         }
     }
@@ -148,6 +150,13 @@ pub async fn generate_summary(
         .map_err(|e| e.to_string());
     }
 
+    // Handle OpenCode provider separately (uses CLI tool, no HTTP API)
+    if provider == &LLMProvider::OpenCode {
+        return generate_with_opencode(system_prompt, user_prompt, cancellation_token)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
     let (api_url, mut headers) = match provider {
         LLMProvider::OpenAI => (
             "https://api.openai.com/v1/chat/completions".to_string(),
@@ -197,6 +206,9 @@ pub async fn generate_summary(
         LLMProvider::BuiltInAI => {
             // This case is handled earlier with early returns
             unreachable!("BuiltInAI is handled before this match statement")
+        }
+        LLMProvider::OpenCode => {
+            unreachable!("OpenCode is handled before this match statement")
         }
     };
 
@@ -342,5 +354,161 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+        LLMProvider::OpenCode => "OpenCode",
     }
+}
+
+/// Generates a summary using the OpenCode CLI tool.
+///
+/// Runs `opencode run --format json --pure "<prompt>"` and parses the NDJSON
+/// event stream from stdout. Text content is extracted from events with
+/// `"type":"text"` by concatenating all `.part.text` values. The session ID
+/// is captured from the first event for potential follow-up queries.
+///
+/// OpenCode is already authenticated with an LLM provider, so no API key
+/// or model selection is needed.
+///
+/// # JSON event stream format (one JSON object per line):
+/// ```json
+/// {"type":"step_start","sessionID":"ses_...","part":{...}}
+/// {"type":"text","sessionID":"ses_...","part":{"type":"text","text":"..."}}
+/// {"type":"step_finish","sessionID":"ses_...","part":{"type":"step-finish","tokens":{...}}}
+/// ```
+///
+/// TODO: Support follow-up queries on the same session using
+///       `opencode run --session <sessionID> --format json "<follow-up prompt>"`
+///       This would allow iterative refinement of summaries (e.g., "expand the
+///       action items" or "reformat as bullet points"). The session ID is already
+///       captured below -- wire it through to the UI so users can trigger follow-ups.
+async fn generate_with_opencode(
+    system_prompt: &str,
+    user_prompt: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::process::Command;
+
+    if let Some(token) = cancellation_token {
+        if token.is_cancelled() {
+            return Err("Summary generation was cancelled".into());
+        }
+    }
+
+    let combined_prompt = format!(
+        "{}\n\n---\n\n{}",
+        system_prompt, user_prompt
+    );
+
+    // Resolve opencode binary path: prefer $HOME/.local/bin/opencode, fall back to PATH
+    let opencode_bin = std::env::var("HOME")
+        .map(|h| format!("{}/.local/bin/opencode", h))
+        .unwrap_or_else(|_| "opencode".to_string());
+
+    info!("Spawning OpenCode CLI: {}", opencode_bin);
+
+    let mut child = Command::new(&opencode_bin)
+        .arg("run")
+        .arg("--format").arg("json")
+        .arg("--pure")  // skip plugins to keep it fast
+        .arg(&combined_prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!(
+            "Failed to spawn opencode ({}): {}. Is opencode installed?",
+            opencode_bin, e
+        ))?;
+
+    // If we have a cancellation token, race between completion and cancellation
+    // using child.id() to kill the process if cancelled.
+    if let Some(token) = cancellation_token {
+        let pid = child.id();
+        tokio::select! {
+            result = child.wait_with_output() => {
+                let output = result?;
+                return parse_opencode_json_output(&output.stdout, &output.stderr, output.status);
+            }
+            _ = token.cancelled() => {
+                if let Some(pid) = pid {
+                    let _ = tokio::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .output()
+                        .await;
+                }
+                return Err("Summary generation was cancelled".into());
+            }
+        }
+    }
+
+    let output = child.wait_with_output().await?;
+    parse_opencode_json_output(&output.stdout, &output.stderr, output.status)
+}
+
+/// Parse the NDJSON event stream from `opencode run --format json`.
+///
+/// Extracts all text from `"type":"text"` events and concatenates them.
+/// Also captures the session ID for potential follow-up use.
+fn parse_opencode_json_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    status: std::process::ExitStatus,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if !status.success() {
+        let stderr_str = String::from_utf8_lossy(stderr);
+        return Err(format!("opencode exited with {}: {}", status, stderr_str).into());
+    }
+
+    let stdout_str = String::from_utf8_lossy(stdout);
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut session_id: Option<String> = None;
+
+    for line in stdout_str.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let event: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                info!("Skipping non-JSON line from opencode: {} ({})", line, e);
+                continue;
+            }
+        };
+
+        // Capture session ID from the first event that has one
+        if session_id.is_none() {
+            if let Some(sid) = event.get("sessionID").and_then(|v| v.as_str()) {
+                session_id = Some(sid.to_string());
+                info!("OpenCode session ID: {}", sid);
+            }
+        }
+
+        // Extract text content from "type":"text" events
+        if event.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(text) = event
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                text_parts.push(text.to_string());
+            }
+        }
+    }
+
+    if text_parts.is_empty() {
+        return Err(format!(
+            "No text content found in opencode JSON output. Raw stdout: {}",
+            &stdout_str[..stdout_str.len().min(500)]
+        ).into());
+    }
+
+    let result = text_parts.concat();
+    info!(
+        "OpenCode response received ({} chars, {} text events, session: {})",
+        result.len(),
+        text_parts.len(),
+        session_id.as_deref().unwrap_or("unknown")
+    );
+    Ok(result)
 }
