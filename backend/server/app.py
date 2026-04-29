@@ -3,12 +3,13 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - supports running app.py directly.
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
+_git_lock = asyncio.Lock()
 
 
 @asynccontextmanager
@@ -55,7 +57,6 @@ app = FastAPI(title="Meetily Server API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -105,6 +106,21 @@ def _meeting_date(value: str) -> str:
 def _fts_query(value: str) -> str:
     tokens = re.findall(r"[\w]+", value, flags=re.UNICODE)
     return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def _validate_uuid(meeting_id: str) -> None:
+    try:
+        parsed = UUID(meeting_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid meeting_id UUID",
+        ) from exc
+    if str(parsed) != meeting_id.lower():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid meeting_id UUID",
+        )
 
 
 def _run_vault_git_sync(vault_path: Path, export_path: Path) -> None:
@@ -166,7 +182,8 @@ async def export_to_obsidian(
     )
     export_path.write_text(content, encoding="utf-8")
 
-    await asyncio.to_thread(_run_vault_git_sync, vault_path, export_path)
+    async with _git_lock:
+        await asyncio.to_thread(_run_vault_git_sync, vault_path, export_path)
 
 
 async def _fetch_meeting(meeting_id: str) -> Optional[MeetingResponse]:
@@ -269,11 +286,12 @@ async def _summarize_meeting(meeting_id: str) -> None:
             "--format",
             "json",
             "--pure",
-            prompt,
+            "-",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await process.communicate(input=prompt.encode())
 
         if process.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
@@ -326,7 +344,9 @@ async def create_meeting(payload: MeetingCreate) -> MeetingResponse:
 
 
 @app.get("/api/meetings", response_model=list[MeetingListResponse])
-async def list_meetings() -> list[MeetingListResponse]:
+async def list_meetings(offset: int = 0, limit: int = 50) -> list[MeetingListResponse]:
+    bounded_offset = max(0, offset)
+    bounded_limit = max(1, min(limit, 200))
     async with get_db() as db:
         cursor = await db.execute(
             """
@@ -345,7 +365,9 @@ async def list_meetings() -> list[MeetingListResponse]:
             LEFT JOIN transcript_segments ts ON ts.meeting_id = m.id
             GROUP BY m.id, m.title, m.status, m.client_id, m.created_at, m.ended_at
             ORDER BY m.created_at DESC, m.id DESC
-            """
+            LIMIT ? OFFSET ?
+            """,
+            (bounded_limit, bounded_offset),
         )
         rows = await cursor.fetchall()
 
@@ -403,6 +425,7 @@ async def search_transcripts(q: str = "", limit: int = 50) -> list[SearchResult]
 
 @app.get("/api/meetings/{meeting_id}", response_model=MeetingDetailResponse)
 async def get_meeting(meeting_id: str) -> MeetingDetailResponse:
+    _validate_uuid(meeting_id)
     meeting = await _require_meeting(meeting_id)
     segments = await _fetch_transcript_segments(meeting_id)
     summary = await _fetch_latest_summary(meeting_id)
@@ -415,6 +438,7 @@ async def get_meeting(meeting_id: str) -> MeetingDetailResponse:
 
 @app.delete("/api/meetings/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_meeting(meeting_id: str) -> None:
+    _validate_uuid(meeting_id)
     async with get_db() as db:
         cursor = await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
         await db.commit()
@@ -424,19 +448,29 @@ async def delete_meeting(meeting_id: str) -> None:
 
 @app.post("/api/meetings/{meeting_id}/end", response_model=MeetingResponse)
 async def end_meeting(meeting_id: str) -> MeetingResponse:
+    _validate_uuid(meeting_id)
     ended_at = datetime.now(timezone.utc).isoformat()
     async with get_db() as db:
+        cursor = await db.execute("SELECT status FROM meetings WHERE id = ?", (meeting_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+        if row[0] == "completed":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Meeting already completed")
+        if row[0] != "recording":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Meeting is not recording")
+
         cursor = await db.execute(
             """
             UPDATE meetings
             SET status = 'completed', ended_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'recording'
             """,
             (ended_at, meeting_id),
         )
         await db.commit()
         if cursor.rowcount == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Meeting is not recording")
 
     meeting = await _fetch_meeting(meeting_id)
     if meeting is None:
@@ -446,6 +480,10 @@ async def end_meeting(meeting_id: str) -> MeetingResponse:
 
 @app.post("/api/meetings/{meeting_id}/transcript", status_code=status.HTTP_201_CREATED)
 async def upload_transcript(meeting_id: str, payload: TranscriptUpload) -> dict[str, int | str]:
+    _validate_uuid(meeting_id)
+    if len(payload.segments) > 10000:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Too many transcript segments")
+
     await _require_meeting(meeting_id)
     values = [
         (
@@ -460,15 +498,20 @@ async def upload_transcript(meeting_id: str, payload: TranscriptUpload) -> dict[
     ]
 
     async with get_db() as db:
-        await db.executemany(
-            """
-            INSERT INTO transcript_segments (
-                meeting_id, timestamp, text, source, confidence, duration_ms
+        try:
+            await db.executemany(
+                """
+                INSERT INTO transcript_segments (
+                    meeting_id, timestamp, text, source, confidence, duration_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                values,
             )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            values,
-        )
+        except sqlite3.IntegrityError as exc:
+            if "FOREIGN KEY constraint failed" in str(exc):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meeting not found") from exc
+            raise
         await db.commit()
 
     return {"meeting_id": meeting_id, "count": len(values)}
@@ -476,12 +519,14 @@ async def upload_transcript(meeting_id: str, payload: TranscriptUpload) -> dict[
 
 @app.get("/api/meetings/{meeting_id}/transcripts", response_model=list[TranscriptSegmentResponse])
 async def get_transcripts(meeting_id: str) -> list[TranscriptSegmentResponse]:
+    _validate_uuid(meeting_id)
     await _require_meeting(meeting_id)
     return await _fetch_transcript_segments(meeting_id)
 
 
 @app.post("/api/meetings/{meeting_id}/summarize", status_code=status.HTTP_202_ACCEPTED)
 async def summarize_meeting(meeting_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
+    _validate_uuid(meeting_id)
     await _require_meeting(meeting_id)
     background_tasks.add_task(_summarize_meeting, meeting_id)
     return {"meeting_id": meeting_id}
@@ -489,6 +534,7 @@ async def summarize_meeting(meeting_id: str, background_tasks: BackgroundTasks) 
 
 @app.get("/api/meetings/{meeting_id}/summary", response_model=SummaryResponse)
 async def get_summary(meeting_id: str) -> SummaryResponse:
+    _validate_uuid(meeting_id)
     await _require_meeting(meeting_id)
     summary = await _fetch_latest_summary(meeting_id)
     if summary is None:
@@ -497,4 +543,4 @@ async def get_summary(meeting_id: str) -> SummaryResponse:
 
 
 if STATIC_DIR.exists():
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/app", StaticFiles(directory=STATIC_DIR, html=True), name="static")
