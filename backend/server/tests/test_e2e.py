@@ -59,17 +59,21 @@ class TestE2EFullMeetingLifecycle:
                 from server.app import _summarize_meeting
                 await _summarize_meeting(mid)
 
-        # Verify opencode was called with the right prompt
+        # Verify opencode was called with stdin pipe (WI-21: prompt via stdin, not argv)
         mock_exec.assert_called_once()
         call_args = mock_exec.call_args[0]
         assert "opencode" in call_args[0]
         assert "run" in call_args
         assert "--format" in call_args
         assert "--pure" in call_args
-        prompt_arg = call_args[-1]
-        assert "[mic]" in prompt_arg  # source tags present
-        assert "[system]" in prompt_arg
-        assert "API refactor" in prompt_arg  # transcript content present
+        assert "-" in call_args  # stdin marker
+        # Verify prompt was passed via stdin (communicate's input= kwarg)
+        communicate_call = mock_proc.communicate.call_args
+        stdin_bytes = communicate_call.kwargs.get("input", b"")
+        stdin_text = stdin_bytes.decode() if isinstance(stdin_bytes, bytes) else ""
+        assert "[mic]" in stdin_text, f"Expected [mic] in stdin, got: {stdin_text[:200]}"
+        assert "[system]" in stdin_text
+        assert "API refactor" in stdin_text
 
         # 5. Web UI fetches meeting detail -- sees transcript + summary
         resp = await client.get(f"/api/meetings/{mid}")

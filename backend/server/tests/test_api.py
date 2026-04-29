@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import AsyncClient
 
-from .conftest import SAMPLE_SEGMENTS, create_meeting, insert_summary, upload_segments
+from .conftest import NONEXISTENT_UUID, SAMPLE_SEGMENTS, create_meeting, insert_summary, upload_segments
 
 
 # ===========================================================================
@@ -164,7 +164,7 @@ class TestWI1MeetingCRUD:
         assert d["summary"]["content"] == "Great meeting"
 
     async def test_get_meeting_404(self, client: AsyncClient):
-        assert (await client.get("/api/meetings/no-such-id")).status_code == 404
+        assert (await client.get(f"/api/meetings/{NONEXISTENT_UUID}")).status_code == 404
 
     async def test_delete_meeting(self, client: AsyncClient):
         m = await create_meeting(client)
@@ -172,7 +172,7 @@ class TestWI1MeetingCRUD:
         assert (await client.get(f"/api/meetings/{m['id']}")).status_code == 404
 
     async def test_delete_meeting_404(self, client: AsyncClient):
-        assert (await client.delete("/api/meetings/no-such-id")).status_code == 404
+        assert (await client.delete(f"/api/meetings/{NONEXISTENT_UUID}")).status_code == 404
 
     async def test_end_meeting(self, client: AsyncClient):
         m = await create_meeting(client)
@@ -183,7 +183,33 @@ class TestWI1MeetingCRUD:
         assert d["ended_at"] is not None
 
     async def test_end_meeting_404(self, client: AsyncClient):
-        assert (await client.post("/api/meetings/no-such-id/end")).status_code == 404
+        assert (await client.post(f"/api/meetings/{NONEXISTENT_UUID}/end")).status_code == 404
+
+    async def test_end_meeting_already_completed_returns_409(self, client: AsyncClient):
+        """WI-26: Can't end a meeting that's already completed."""
+        m = await create_meeting(client)
+        resp = await client.post(f"/api/meetings/{m['id']}/end")
+        assert resp.status_code == 200
+        resp2 = await client.post(f"/api/meetings/{m['id']}/end")
+        assert resp2.status_code == 409
+
+    async def test_invalid_uuid_returns_422(self, client: AsyncClient):
+        """WI-27: Non-UUID meeting_id returns 422."""
+        assert (await client.get("/api/meetings/not-a-uuid")).status_code == 422
+        assert (await client.delete("/api/meetings/not-a-uuid")).status_code == 422
+        assert (await client.post("/api/meetings/not-a-uuid/end")).status_code == 422
+
+    async def test_list_meetings_pagination(self, client: AsyncClient):
+        """WI-23: Pagination with offset/limit."""
+        for i in range(5):
+            await create_meeting(client, f"Meeting {i}")
+        resp = await client.get("/api/meetings?limit=2&offset=0")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 2
+        resp2 = await client.get("/api/meetings?limit=2&offset=2")
+        assert len(resp2.json()) == 2
+        resp3 = await client.get("/api/meetings?limit=2&offset=4")
+        assert len(resp3.json()) == 1
 
 
 # ===========================================================================
@@ -213,7 +239,7 @@ class TestWI2TranscriptIngestion:
 
     async def test_upload_404_if_meeting_missing(self, client: AsyncClient):
         resp = await client.post(
-            "/api/meetings/no-such-id/transcript",
+            f"/api/meetings/{NONEXISTENT_UUID}/transcript",
             json={"segments": SAMPLE_SEGMENTS},
         )
         assert resp.status_code == 404
@@ -229,7 +255,7 @@ class TestWI2TranscriptIngestion:
         assert segs[1]["source"] == "mic"
 
     async def test_get_transcripts_404(self, client: AsyncClient):
-        assert (await client.get("/api/meetings/no-such-id/transcripts")).status_code == 404
+        assert (await client.get(f"/api/meetings/{NONEXISTENT_UUID}/transcripts")).status_code == 404
 
     async def test_multiple_uploads_append(self, client: AsyncClient):
         m = await create_meeting(client)
@@ -251,6 +277,16 @@ class TestWI2TranscriptIngestion:
         assert segs[0]["confidence"] is None
         assert segs[0]["duration_ms"] is None
 
+    async def test_upload_rejects_over_10000_segments(self, client: AsyncClient):
+        """WI-22: Segment upload capped at 10000."""
+        m = await create_meeting(client)
+        segments = [{"text": f"seg {i}", "source": "mic"} for i in range(10001)]
+        resp = await client.post(
+            f"/api/meetings/{m['id']}/transcript",
+            json={"segments": segments},
+        )
+        assert resp.status_code == 413
+
 
 # ===========================================================================
 # WI-3: Summarization
@@ -267,7 +303,7 @@ class TestWI3Summarization:
         assert resp.json()["meeting_id"] == m["id"]
 
     async def test_summarize_404(self, client: AsyncClient):
-        resp = await client.post("/api/meetings/no-such-id/summarize")
+        resp = await client.post(f"/api/meetings/{NONEXISTENT_UUID}/summarize")
         assert resp.status_code == 404
 
     async def test_get_summary_404_when_none(self, client: AsyncClient):
@@ -275,7 +311,7 @@ class TestWI3Summarization:
         assert (await client.get(f"/api/meetings/{m['id']}/summary")).status_code == 404
 
     async def test_get_summary_404_when_meeting_missing(self, client: AsyncClient):
-        assert (await client.get("/api/meetings/no-such-id/summary")).status_code == 404
+        assert (await client.get(f"/api/meetings/{NONEXISTENT_UUID}/summary")).status_code == 404
 
     async def test_get_summary(self, client: AsyncClient):
         m = await create_meeting(client)
@@ -423,12 +459,12 @@ class TestWI5WebUI:
     """The static HTML file is served correctly."""
 
     async def test_index_html_served(self, client: AsyncClient):
-        resp = await client.get("/")
+        resp = await client.get("/app/")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
 
     async def test_index_contains_fetch_calls(self, client: AsyncClient):
-        resp = await client.get("/")
+        resp = await client.get("/app/")
         body = resp.text
         assert "/api/meetings" in body  # References the API
         assert "fetch" in body.lower() or "XMLHttpRequest" in body.lower()

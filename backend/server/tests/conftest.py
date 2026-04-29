@@ -97,6 +97,11 @@ async def upload_segments(client: AsyncClient, meeting_id: str, segments=None) -
     return resp.json()
 
 
+# A valid UUID format that doesn't exist in the DB -- use for 404 tests.
+# (Invalid UUIDs like "no-such-id" now return 422 due to WI-27 validation.)
+NONEXISTENT_UUID = "00000000-0000-4000-a000-000000000000"
+
+
 async def insert_summary(meeting_id: str, content: str) -> None:
     """Directly insert a summary (bypasses opencode subprocess)."""
     import aiosqlite
