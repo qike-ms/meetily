@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+import os
+import re
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +12,7 @@ from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 try:
     from .database import get_db, init_db
@@ -17,6 +21,7 @@ try:
         MeetingDetailResponse,
         MeetingListResponse,
         MeetingResponse,
+        SearchResult,
         SummaryResponse,
         TranscriptSegmentResponse,
         TranscriptUpload,
@@ -28,6 +33,7 @@ except ImportError:  # pragma: no cover - supports running app.py directly.
         MeetingDetailResponse,
         MeetingListResponse,
         MeetingResponse,
+        SearchResult,
         SummaryResponse,
         TranscriptSegmentResponse,
         TranscriptUpload,
@@ -35,6 +41,7 @@ except ImportError:  # pragma: no cover - supports running app.py directly.
 
 
 logger = logging.getLogger(__name__)
+STATIC_DIR = Path(__file__).parent / "static"
 
 
 @asynccontextmanager
@@ -84,6 +91,82 @@ def _row_to_summary(row: Sequence[Any]) -> SummaryResponse:
         content=row[2],
         created_at=row[3],
     )
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "untitled-meeting"
+
+
+def _meeting_date(value: str) -> str:
+    return value.split("T", 1)[0].split(" ", 1)[0]
+
+
+def _fts_query(value: str) -> str:
+    tokens = re.findall(r"[\w]+", value, flags=re.UNICODE)
+    return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def _run_vault_git_sync(vault_path: Path, export_path: Path) -> None:
+    relative_path = export_path.relative_to(vault_path)
+    commands = (
+        ["git", "add", str(relative_path)],
+        ["git", "commit", "-m", f"Add Meetily export for {export_path.stem}"],
+        ["git", "push"],
+    )
+
+    for command in commands:
+        completed = subprocess.run(
+            command,
+            cwd=vault_path,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if completed.returncode != 0:
+            output = (completed.stderr or completed.stdout).strip()
+            if command[1] == "commit" and "nothing to commit" in output.lower():
+                logger.info("Obsidian export unchanged; skipping git push for %s", export_path)
+                return
+            raise RuntimeError(f"{' '.join(command)} failed: {output}")
+
+
+async def export_to_obsidian(
+    meeting_id: str,
+    title: Optional[str],
+    transcript_text: str,
+    summary_text: str,
+) -> None:
+    meeting = await _fetch_meeting(meeting_id)
+    if meeting is None:
+        raise RuntimeError(f"Meeting {meeting_id} disappeared before Obsidian export")
+
+    vault_path = Path(os.getenv("OBSIDIAN_VAULT_PATH", "~/git/obsidian-vault")).expanduser()
+    export_dir = vault_path / "projects" / "meetily" / "meetings"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    display_title = title or "Untitled Meeting"
+    export_path = export_dir / f"{_meeting_date(meeting.created_at)}-{_slugify(display_title)}.md"
+    content = "\n".join(
+        [
+            "---",
+            f"meeting_id: {meeting_id}",
+            f"date: {meeting.created_at}",
+            f"status: {meeting.status}",
+            "---",
+            f"# {display_title}",
+            "",
+            "## Summary",
+            summary_text.strip(),
+            "",
+            "## Transcript",
+            transcript_text.strip(),
+            "",
+        ]
+    )
+    export_path.write_text(content, encoding="utf-8")
+
+    await asyncio.to_thread(_run_vault_git_sync, vault_path, export_path)
 
 
 async def _fetch_meeting(meeting_id: str) -> Optional[MeetingResponse]:
@@ -209,6 +292,11 @@ async def _summarize_meeting(meeting_id: str) -> None:
                 (meeting_id, summary_text),
             )
             await db.commit()
+
+        try:
+            await export_to_obsidian(meeting_id, meeting.title, formatted_text, summary_text)
+        except Exception:
+            logger.exception("Failed to export meeting %s to Obsidian", meeting_id)
     except Exception:
         logger.exception("Failed to summarize meeting %s", meeting_id)
 
@@ -271,6 +359,43 @@ async def list_meetings() -> list[MeetingListResponse]:
             ended_at=row[5],
             segment_count=row[6],
             has_summary=bool(row[7]),
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/search", response_model=list[SearchResult])
+async def search_transcripts(q: str = "", limit: int = 50) -> list[SearchResult]:
+    query = _fts_query(q.strip())
+    if not query:
+        return []
+
+    bounded_limit = max(1, min(limit, 200))
+    async with get_db() as db:
+        cursor = await db.execute(
+            """
+            SELECT
+                ts.meeting_id,
+                m.title,
+                snippet(transcript_fts, 0, '<mark>', '</mark>', '...', 32) AS snippet,
+                ts.timestamp
+            FROM transcript_fts
+            JOIN transcript_segments ts ON ts.id = transcript_fts.rowid
+            JOIN meetings m ON m.id = ts.meeting_id
+            WHERE transcript_fts MATCH ?
+            ORDER BY bm25(transcript_fts), ts.timestamp IS NULL, ts.timestamp ASC, ts.id ASC
+            LIMIT ?
+            """,
+            (query, bounded_limit),
+        )
+        rows = await cursor.fetchall()
+
+    return [
+        SearchResult(
+            meeting_id=row[0],
+            meeting_title=row[1],
+            snippet=row[2],
+            timestamp=row[3],
         )
         for row in rows
     ]
@@ -369,3 +494,7 @@ async def get_summary(meeting_id: str) -> SummaryResponse:
     if summary is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Summary not found")
     return summary
+
+
+if STATIC_DIR.exists():
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
