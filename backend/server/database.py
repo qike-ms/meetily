@@ -66,6 +66,10 @@ async def get_db(db_path: str = DB_PATH) -> AsyncIterator[aiosqlite.Connection]:
     await db.execute("PRAGMA foreign_keys = ON")
     try:
         yield db
+        await db.commit()
+    except BaseException:
+        await db.rollback()
+        raise
     finally:
         await db.close()
 

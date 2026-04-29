@@ -54,9 +54,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Meetily Server API", lifespan=lifespan)
 
+_cors_origins = os.getenv("MEETILY_CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
