@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 class MeetingCreate(BaseModel):
     title: Optional[str] = None
+    client_id: Optional[str] = None
 
 
 class MeetingResponse(BaseModel):
@@ -24,6 +25,11 @@ class TranscriptSegment(BaseModel):
     duration_ms: Optional[int] = None
 
 
+class TranscriptSegmentResponse(TranscriptSegment):
+    id: int
+    meeting_id: str
+
+
 class TranscriptUpload(BaseModel):
     segments: List[TranscriptSegment]
 
@@ -40,3 +46,13 @@ class SearchResult(BaseModel):
     meeting_title: Optional[str] = None
     snippet: str
     timestamp: Optional[str] = None
+
+
+class MeetingListResponse(MeetingResponse):
+    segment_count: int
+    has_summary: bool
+
+
+class MeetingDetailResponse(MeetingResponse):
+    transcript_segments: List[TranscriptSegmentResponse]
+    summary: Optional[SummaryResponse] = None
