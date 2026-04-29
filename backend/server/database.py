@@ -61,6 +61,8 @@ END;
 @asynccontextmanager
 async def get_db(db_path: str = DB_PATH) -> AsyncIterator[aiosqlite.Connection]:
     db = await aiosqlite.connect(db_path)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
     await db.execute("PRAGMA foreign_keys = ON")
     try:
         yield db
@@ -70,5 +72,7 @@ async def get_db(db_path: str = DB_PATH) -> AsyncIterator[aiosqlite.Connection]:
 
 async def init_db(db_path: str = DB_PATH) -> None:
     async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(SCHEMA_SQL)
         await db.commit()

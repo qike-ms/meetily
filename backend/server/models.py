@@ -1,11 +1,11 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MeetingCreate(BaseModel):
-    title: Optional[str] = None
-    client_id: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=500)
+    client_id: Optional[str] = Field(default=None, max_length=100)
 
 
 class MeetingResponse(BaseModel):
@@ -18,8 +18,8 @@ class MeetingResponse(BaseModel):
 
 
 class TranscriptSegment(BaseModel):
-    timestamp: Optional[str] = None
-    text: str
+    timestamp: Optional[str] = Field(default=None, max_length=50)
+    text: str = Field(max_length=50000)
     source: Literal["mic", "system"]
     confidence: Optional[float] = None
     duration_ms: Optional[int] = None

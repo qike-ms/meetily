@@ -138,6 +138,7 @@ def _run_vault_git_sync(vault_path: Path, export_path: Path) -> None:
             capture_output=True,
             check=False,
             text=True,
+            timeout=30,
         )
         if completed.returncode != 0:
             output = (completed.stderr or completed.stdout).strip()
@@ -162,7 +163,7 @@ async def export_to_obsidian(
     export_dir.mkdir(parents=True, exist_ok=True)
 
     display_title = title or "Untitled Meeting"
-    export_path = export_dir / f"{_meeting_date(meeting.created_at)}-{_slugify(display_title)}.md"
+    export_path = export_dir / f"{_meeting_date(meeting.created_at)}-{_slugify(display_title)}-{meeting_id[:8]}.md"
     content = "\n".join(
         [
             "---",
@@ -291,7 +292,15 @@ async def _summarize_meeting(meeting_id: str) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate(input=prompt.encode())
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input=prompt.encode()),
+                timeout=300,
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise RuntimeError("opencode timed out after 300 seconds") from exc
 
         if process.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
@@ -483,6 +492,11 @@ async def upload_transcript(meeting_id: str, payload: TranscriptUpload) -> dict[
     _validate_uuid(meeting_id)
     if len(payload.segments) > 10000:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Too many transcript segments")
+    if sum(len(segment.text) for segment in payload.segments) > 5_000_000:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Total text size exceeds 5MB limit",
+        )
 
     await _require_meeting(meeting_id)
     values = [
