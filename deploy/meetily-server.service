@@ -1,0 +1,16 @@
+[Unit]
+Description=Meetily FastAPI server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/git/meetily/backend
+EnvironmentFile=%h/.config/meetily/server.env
+Environment=PYTHONPATH=%h/git/meetily/backend/app
+ExecStart=/usr/bin/env uvicorn app.main:app --host 0.0.0.0 --port 5167
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
