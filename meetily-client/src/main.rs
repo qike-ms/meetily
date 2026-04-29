@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use meetily_client::audio::capture::record_dual_stream;
 use meetily_client::audio::devices::list_devices;
 use meetily_client::transcribe::{
-    download_model, get_model_path, merge_segments, transcribe_wav,
+    download_model, get_model_path, load_model, merge_segments, transcribe_wav,
 };
 use meetily_client::upload::{
     create_meeting, end_meeting, trigger_summarize, upload_transcript_and_get_meeting_id,
@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
                     model
                 );
             }
+            let whisper = load_model(&model_path)?;
 
             println!("Recording meeting {meeting_id}. Press Ctrl+C to stop.");
             let stop = CancellationToken::new();
@@ -86,11 +87,11 @@ async fn main() -> Result<()> {
 
             let (mic_wav, system_wav) = recording.await??;
             println!("Transcribing microphone audio: {}", mic_wav.display());
-            let mic_segments = transcribe_wav(&mic_wav, &model_path, "mic")?;
+            let mic_segments = transcribe_wav(&mic_wav, &whisper, "mic")?;
 
             let system_segments = if system_wav.metadata().map(|m| m.len()).unwrap_or(0) > 44 {
                 println!("Transcribing system audio: {}", system_wav.display());
-                transcribe_wav(&system_wav, &model_path, "system")?
+                transcribe_wav(&system_wav, &whisper, "system")?
             } else {
                 Vec::new()
             };
@@ -98,13 +99,14 @@ async fn main() -> Result<()> {
             let segments = merge_segments(mic_segments, system_segments);
             let saved_meeting_id =
                 upload_transcript_and_get_meeting_id(&server, &meeting_id, &segments).await?;
+            delete_temp_wav(&mic_wav).await;
+            delete_temp_wav(&system_wav).await;
             trigger_summarize(&server, &saved_meeting_id).await?;
             end_meeting(&server, &saved_meeting_id).await?;
 
             println!("Meeting complete.");
             println!("  Meeting ID: {saved_meeting_id}");
-            println!("  Mic WAV: {}", mic_wav.display());
-            println!("  System WAV: {}", system_wav.display());
+            println!("  Temp WAV files deleted after upload.");
             println!("  Segments uploaded: {}", segments.len());
         }
         Commands::Devices => {
@@ -119,4 +121,12 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn delete_temp_wav(path: &std::path::Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!("failed to delete temp WAV {}: {err}", path.display()),
+    }
 }

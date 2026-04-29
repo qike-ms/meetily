@@ -24,9 +24,19 @@ pub struct TranscriptSegment {
     pub duration: Option<f64>,
 }
 
+pub fn load_model(model_path: impl AsRef<Path>) -> Result<WhisperContext> {
+    let model = model_path.as_ref().to_string_lossy();
+    WhisperContext::new_with_params(&model, WhisperContextParameters::default()).map_err(|err| {
+        anyhow!(
+            "failed to load whisper model {}: {err}",
+            model_path.as_ref().display()
+        )
+    })
+}
+
 pub fn transcribe_wav(
     wav_path: impl AsRef<Path>,
-    model_path: impl AsRef<Path>,
+    ctx: &WhisperContext,
     source_tag: &str,
 ) -> Result<Vec<TranscriptSegment>> {
     let samples = read_wav_mono_16k(wav_path.as_ref())?;
@@ -34,9 +44,6 @@ pub fn transcribe_wav(
         return Ok(Vec::new());
     }
 
-    let model = model_path.as_ref().to_string_lossy();
-    let ctx = WhisperContext::new_with_params(&model, WhisperContextParameters::default())
-        .map_err(|err| anyhow!("failed to load whisper model {}: {err}", model_path.as_ref().display()))?;
     let mut state = ctx.create_state()?;
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
         beam_size: 5,
@@ -64,7 +71,10 @@ pub fn transcribe_wav(
         }
 
         let start = state.full_get_segment_t0(index).unwrap_or(0).max(0) as u64;
-        let end = state.full_get_segment_t1(index).unwrap_or(start as i64).max(start as i64) as u64;
+        let end = state
+            .full_get_segment_t1(index)
+            .unwrap_or(start as i64)
+            .max(start as i64) as u64;
         let start_seconds = start as f64 / 100.0;
         let end_seconds = end as f64 / 100.0;
         let duration = (end_seconds - start_seconds).max(0.0);
@@ -118,33 +128,52 @@ pub async fn download_model(model_name: &str) -> Result<PathBuf> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let url = format!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin"
-    );
-    let response = reqwest::get(&url).await?.error_for_status()?;
-    let total = response.content_length();
+    let url =
+        format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model_name}.bin");
     let temp_path = path.with_extension("bin.part");
-    let mut file = tokio::fs::File::create(&temp_path).await?;
-    let mut downloaded = 0_u64;
-    let mut response = response;
+    let download_result = async {
+        let response = reqwest::get(&url).await?.error_for_status()?;
+        let total = response.content_length();
+        let mut file = tokio::fs::File::create(&temp_path).await?;
+        let mut downloaded = 0_u64;
+        let mut response = response;
 
-    while let Some(chunk) = response.chunk().await? {
-        use tokio::io::AsyncWriteExt;
+        while let Some(chunk) = response.chunk().await? {
+            use tokio::io::AsyncWriteExt;
 
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
 
-        if let Some(total) = total {
-            let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
-            eprint!("\rDownloading {model_name}: {pct:>5.1}%");
-        } else {
-            eprint!("\rDownloading {model_name}: {:.1} MB", downloaded as f64 / 1_048_576.0);
+            if let Some(total) = total {
+                let pct = (downloaded as f64 / total as f64 * 100.0).min(100.0);
+                eprint!("\rDownloading {model_name}: {pct:>5.1}%");
+            } else {
+                eprint!(
+                    "\rDownloading {model_name}: {:.1} MB",
+                    downloaded as f64 / 1_048_576.0
+                );
+            }
         }
-    }
-    eprintln!();
 
-    file.sync_all().await?;
-    tokio::fs::rename(&temp_path, &path).await?;
+        eprintln!();
+        file.sync_all().await?;
+        tokio::fs::rename(&temp_path, &path).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(err) = download_result {
+        if let Err(cleanup_err) = tokio::fs::remove_file(&temp_path).await {
+            if cleanup_err.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "failed to remove partial model download {}: {cleanup_err}",
+                    temp_path.display()
+                );
+            }
+        }
+        return Err(err);
+    }
+
     Ok(path)
 }
 
