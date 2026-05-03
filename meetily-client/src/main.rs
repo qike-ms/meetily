@@ -6,7 +6,7 @@ use meetily_client::transcribe::{
     download_model, get_model_path, load_model, merge_segments, transcribe_wav,
 };
 use meetily_client::upload::{
-    create_meeting, end_meeting, trigger_summarize, upload_transcript_and_get_meeting_id,
+    create_meeting, end_meeting, trigger_summarize, upload_transcript,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -57,57 +57,103 @@ async fn main() -> Result<()> {
             system,
             model,
         } => {
-            if mic.is_none() || system.is_none() {
-                println!("Available audio devices:");
-                for device in list_devices() {
-                    println!("  {device}");
-                }
-                println!();
+            println!("\n=== Meetily Client ===");
+            println!("Available audio devices:");
+            for device in list_devices() {
+                println!("  {device}");
             }
+            println!();
 
             let client_id = Uuid::new_v4().to_string();
+            println!("Creating meeting on server...");
             let meeting_id = create_meeting(&server, &title, &client_id).await?;
+            println!("Meeting created: {meeting_id}");
+
             let model_path = get_model_path(&model);
             if !model_path.exists() {
                 anyhow::bail!(
-                    "Whisper model not found at {}. Run `meetily-client download-model {}` first.",
+                    "Whisper model not found at {}.\nRun: meetily-client download-model {}",
                     model_path.display(),
                     model
                 );
             }
+            println!("Loading Whisper model: {} ...", model);
             let whisper = load_model(&model_path)?;
+            println!("Model loaded.");
 
-            println!("Recording meeting {meeting_id}. Press Ctrl+C to stop.");
+            println!("\n>>> Recording started. Press Ctrl+C to stop. <<<\n");
             let stop = CancellationToken::new();
             let recording = tokio::spawn(record_dual_stream(mic, system, stop.clone()));
 
             tokio::signal::ctrl_c().await?;
-            println!("Stopping recording...");
+            println!("\n>>> Recording stopped. <<<\n");
             stop.cancel();
 
             let (mic_wav, system_wav) = recording.await??;
-            println!("Transcribing microphone audio: {}", mic_wav.display());
-            let mic_segments = transcribe_wav(&mic_wav, &whisper, "mic")?;
 
-            let system_segments = if system_wav.metadata().map(|m| m.len()).unwrap_or(0) > 44 {
-                println!("Transcribing system audio: {}", system_wav.display());
-                transcribe_wav(&system_wav, &whisper, "system")?
+            // Transcribe mic
+            println!("Transcribing microphone audio...");
+            let mic_segments = transcribe_wav(&mic_wav, &whisper, "mic")?;
+            if mic_segments.is_empty() {
+                println!("  (no speech detected from mic)");
             } else {
+                println!("\n--- Mic Transcript ({} segments) ---", mic_segments.len());
+                for seg in &mic_segments {
+                    println!("  [{}] {}", seg.timestamp, seg.text);
+                }
+                println!("---\n");
+            }
+
+            // Transcribe system
+            let system_segments = if system_wav.metadata().map(|m| m.len()).unwrap_or(0) > 44 {
+                println!("Transcribing system audio...");
+                let segs = transcribe_wav(&system_wav, &whisper, "system")?;
+                if segs.is_empty() {
+                    println!("  (no speech detected from system)");
+                } else {
+                    println!("\n--- System Transcript ({} segments) ---", segs.len());
+                    for seg in &segs {
+                        println!("  [{}] {}", seg.timestamp, seg.text);
+                    }
+                    println!("---\n");
+                }
+                segs
+            } else {
+                println!("  (no system audio recorded)");
                 Vec::new()
             };
 
+            // Merge and display combined
             let segments = merge_segments(mic_segments, system_segments);
-            let saved_meeting_id =
-                upload_transcript_and_get_meeting_id(&server, &meeting_id, &segments).await?;
+            if !segments.is_empty() {
+                println!("\n=== Combined Transcript ({} segments) ===", segments.len());
+                for seg in &segments {
+                    let label = if seg.source == "mic" { "YOU" } else { "THEM" };
+                    println!("  [{}] [{}] {}", seg.timestamp, label, seg.text);
+                }
+                println!("===\n");
+            }
+
+            // Upload
+            println!("Uploading transcript to server...");
+            upload_transcript(&server, &meeting_id, &segments).await?;
+            println!("Uploaded {} segments.", segments.len());
+
+            // Cleanup temp files
             delete_temp_wav(&mic_wav).await;
             delete_temp_wav(&system_wav).await;
-            trigger_summarize(&server, &saved_meeting_id).await?;
-            end_meeting(&server, &saved_meeting_id).await?;
 
-            println!("Meeting complete.");
-            println!("  Meeting ID: {saved_meeting_id}");
-            println!("  Temp WAV files deleted after upload.");
-            println!("  Segments uploaded: {}", segments.len());
+            // Summarize and end
+            println!("Triggering summarization...");
+            trigger_summarize(&server, &meeting_id).await?;
+            end_meeting(&server, &meeting_id).await?;
+
+            println!("\n=== Meeting Complete ===");
+            println!("  ID:       {meeting_id}");
+            println!("  Title:    {title}");
+            println!("  Segments: {}", segments.len());
+            println!("  View at:  {}/app/", server);
+            println!();
         }
         Commands::Devices => {
             for device in list_devices() {
