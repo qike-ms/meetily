@@ -441,8 +441,13 @@ mod tests {
     #[test]
     fn test_builtin_mic_detection() {
         let kind = InputDeviceKind::detect("MacBook Pro Microphone", 0, 0);
-        // Should fall through to Unknown (no Bluetooth pattern, no buffer size)
-        assert_eq!(kind, InputDeviceKind::Unknown);
+        // On macOS, Core Audio native detection identifies this as BUILT_IN → Wired.
+        // On other platforms, falls through to Unknown (no Bluetooth pattern, no buffer size).
+        if cfg!(target_os = "macos") {
+            assert_eq!(kind, InputDeviceKind::Wired);
+        } else {
+            assert_eq!(kind, InputDeviceKind::Unknown);
+        }
     }
 
     #[test]

@@ -9,5 +9,4 @@ pub use transcribe::{
 };
 pub use upload::{
     create_meeting, end_meeting, trigger_summarize, upload_transcript,
-    upload_transcript_and_get_meeting_id,
 };

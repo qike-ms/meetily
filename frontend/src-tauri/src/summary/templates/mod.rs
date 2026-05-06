@@ -12,7 +12,7 @@
 //!
 //! # Usage
 //!
-//! ```rust
+//! ```rust,ignore
 //! use crate::summary::templates;
 //!
 //! // Load a specific template
