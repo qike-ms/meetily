@@ -148,12 +148,20 @@ impl ActiveCapture {
     }
 
     fn stop(mut self) -> Result<()> {
+        // Drop the cpal stream first so no more samples are pushed.
         self.stream.take();
         if let Some(sender) = self.sender.take() {
+            // Best-effort Finish; falling out of scope drops the sender too.
             let _ = sender.send(WriterMessage::Finish);
         }
         if let Some(sender) = self.raw_sender.take() {
-            let _ = sender.send(RawAudioMessage::Finish);
+            // For streaming pumps we don't try to send Finish (raw channel is
+            // bounded; main task may not have started draining utterances
+            // yet). Dropping the sender closes the channel so the pump's
+            // recv() returns Err and it exits its loop. The Finish variant
+            // is only used by the legacy WAV writer path which uses an
+            // unbounded send pattern.
+            drop(sender);
         }
         if let Some(writer_thread) = self.writer_thread.take() {
             writer_thread
@@ -170,11 +178,10 @@ enum WriterMessage {
 }
 
 /// Raw audio frames produced by a streaming capture, before resampling.
-enum RawAudioMessage {
-    /// Interleaved (or mono) f32 samples at the source rate.
-    Samples(Vec<f32>),
-    Finish,
-}
+/// Channel close (sender dropped) signals end of stream — no explicit
+/// Finish variant is needed because the raw channel is bounded and we
+/// don't want the producer to ever block trying to enqueue a sentinel.
+struct RawAudioMessage(Vec<f32>);
 
 /// Start a streaming dual-source capture: mic (always) and optionally system.
 /// Each captured speech utterance is pushed to the returned mpsc receiver.
@@ -239,32 +246,43 @@ fn spawn_pump_thread(
     let handle = thread::Builder::new()
         .name(format!("meetily-pump-{}", source.as_str()))
         .spawn(move || -> Result<()> {
-            while let Ok(msg) = raw_rx.recv() {
-                match msg {
-                    RawAudioMessage::Samples(samples) => {
-                        let frames = resampler.push(&samples).with_context(|| {
-                            format!("resampler failed for {}", source.as_str())
-                        })?;
-                        for frame in frames {
-                            let utts = vad
-                                .process_frame(&frame)
-                                .with_context(|| format!("vad failed for {}", source.as_str()))?;
-                            for utterance in utts {
-                                let chunk = StreamingChunk {
-                                    source,
-                                    utterance,
-                                };
-                                if utt_tx.blocking_send(chunk).is_err() {
-                                    log::debug!(
-                                        "{} pump: receiver dropped, exiting",
-                                        source.as_str()
-                                    );
-                                    return Ok(());
-                                }
-                            }
+            // Drain raw audio until the producer (cpal stream) is dropped.
+            while let Ok(RawAudioMessage(samples)) = raw_rx.recv() {
+                let frames = resampler.push(&samples).with_context(|| {
+                    format!("resampler failed for {}", source.as_str())
+                })?;
+                for frame in frames {
+                    let utts = vad
+                        .process_frame(&frame)
+                        .with_context(|| format!("vad failed for {}", source.as_str()))?;
+                    for utterance in utts {
+                        let chunk = StreamingChunk { source, utterance };
+                        if utt_tx.blocking_send(chunk).is_err() {
+                            log::debug!(
+                                "{} pump: receiver dropped, exiting",
+                                source.as_str()
+                            );
+                            return Ok(());
                         }
                     }
-                    RawAudioMessage::Finish => break,
+                }
+            }
+
+            // Stream ended -- flush any in-progress utterance by feeding
+            // enough silence (redemption_time + post_speech_pad + slack ~=
+            // 1 s @ 16 kHz) so VAD emits a SpeechEnd for whatever speech
+            // was in flight when the user stopped recording.
+            let silence_frame = vec![0.0f32; super::vad::VAD_FRAME_SAMPLES];
+            let flush_frames = (super::vad::VAD_SAMPLE_RATE / super::vad::VAD_FRAME_SAMPLES) + 1;
+            for _ in 0..flush_frames {
+                let utts = vad
+                    .process_frame(&silence_frame)
+                    .with_context(|| format!("vad flush failed for {}", source.as_str()))?;
+                for utterance in utts {
+                    let chunk = StreamingChunk { source, utterance };
+                    if utt_tx.blocking_send(chunk).is_err() {
+                        return Ok(());
+                    }
                 }
             }
             Ok(())
@@ -333,7 +351,7 @@ where
             for sample in data.iter() {
                 floats.push(f32::from_sample(*sample));
             }
-            match sender.try_send(RawAudioMessage::Samples(floats)) {
+            match sender.try_send(RawAudioMessage(floats)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     log::warn!("streaming raw channel full, dropping {} samples", data.len());

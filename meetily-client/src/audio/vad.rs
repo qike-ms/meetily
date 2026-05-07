@@ -60,7 +60,10 @@ impl Utterance {
 pub struct Vad {
     session: VadSession,
     /// Wall-clock start of the current speech segment, used to assign a
-    /// `start_ms` to force-emitted utterances.
+    /// `start_ms` to force-emitted utterances. Reset on natural SpeechEnd.
+    /// On a forced emit we advance this by `MAX_UTTERANCE_MS` so subsequent
+    /// forced slices in the same continuous speech segment get monotonic
+    /// timestamps.
     current_speech_start_ms: Option<u64>,
 }
 
@@ -122,14 +125,22 @@ impl Vad {
             }
         }
 
-        // Force-emit if currently speaking and the speech segment has grown
-        // beyond MAX_UTTERANCE_MS. take_until slices samples off the front
-        // of the active speech buffer so the session can keep going.
+        // Force-emit if currently speaking and the live speech buffer has
+        // grown beyond MAX_UTTERANCE_MS. `take_until(end)` interprets `end`
+        // as absolute session time (per silero source) and trims the front
+        // of the active speech buffer, advancing speech_start_ms internally
+        // so the residual buffer remains continuous.
+        //
+        // Slice we want = first MAX_UTTERANCE_MS of the *current* speech.
+        // Target session time for take_until = session_time - (current_speech_duration - MAX).
         if self.session.is_speaking() {
-            let dur_ms = self.session.current_speech_duration().as_millis() as u64;
-            if dur_ms >= MAX_UTTERANCE_MS {
-                let cut = Duration::from_millis(MAX_UTTERANCE_MS);
-                let forced_samples = self.session.take_until(cut);
+            let speech_dur = self.session.current_speech_duration();
+            let max = Duration::from_millis(MAX_UTTERANCE_MS);
+            if speech_dur >= max {
+                let session_time = self.session.session_time();
+                let cut_to = session_time
+                    .saturating_sub(speech_dur.saturating_sub(max));
+                let forced_samples = self.session.take_until(cut_to);
                 if forced_samples.len() >= MIN_UTTERANCE_SAMPLES {
                     let start_ms = self.current_speech_start_ms.unwrap_or(0);
                     let end_ms = start_ms + MAX_UTTERANCE_MS;
@@ -139,7 +150,9 @@ impl Vad {
                         end_ms,
                         forced: true,
                     });
-                    // Advance the logical start for any subsequent forced cut.
+                    // Advance the logical start so subsequent forced slices
+                    // in the same continuous speech segment have monotonic
+                    // timestamps.
                     self.current_speech_start_ms = Some(end_ms);
                 }
             }
