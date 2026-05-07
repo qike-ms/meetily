@@ -49,13 +49,24 @@ pub struct StreamingHandle {
 }
 
 impl StreamingHandle {
-    pub fn stop(mut self) -> Result<()> {
+    /// Stop cpal streams and signal pump threads to finish their pending raw
+    /// audio buffer. Does NOT join pump threads — call `await_completion()`
+    /// after the receiver has been fully drained, otherwise the pumps may
+    /// deadlock on a full utterance channel.
+    pub fn request_stop(&mut self) -> Result<()> {
         if let Some(cap) = self.mic_capture.take() {
             cap.stop()?;
         }
         if let Some(cap) = self.system_capture.take() {
             cap.stop()?;
         }
+        Ok(())
+    }
+
+    /// Join pump threads. Must only be called once the utterance receiver is
+    /// being drained (or has been dropped) so blocking_send calls inside the
+    /// pumps can complete.
+    pub fn await_completion(mut self) -> Result<()> {
         if let Some(t) = self.mic_pump.take() {
             t.join()
                 .map_err(|_| anyhow!("mic pump thread panicked"))??;
@@ -65,6 +76,13 @@ impl StreamingHandle {
                 .map_err(|_| anyhow!("system pump thread panicked"))??;
         }
         Ok(())
+    }
+
+    /// Convenience: request_stop + immediately await_completion. Only safe if
+    /// you are certain the utterance receiver is being polled concurrently.
+    pub fn stop(mut self) -> Result<()> {
+        self.request_stop()?;
+        self.await_completion()
     }
 }
 

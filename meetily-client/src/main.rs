@@ -139,7 +139,7 @@ async fn run_streaming_session(
 ) -> Result<Vec<TranscriptSegment>> {
     println!("\n>>> Recording started (streaming VAD). Press Ctrl+C to stop. <<<\n");
 
-    let (handle, mut rx) = record_streaming(mic, system).context("failed to start streaming capture")?;
+    let (mut handle, mut rx) = record_streaming(mic, system).context("failed to start streaming capture")?;
     let recording_started = Instant::now();
     let stop = CancellationToken::new();
     let stop_for_signal = stop.clone();
@@ -172,14 +172,21 @@ async fn run_streaming_session(
         }
     }
 
-    // Stop the capture pipeline (closes raw + utterance channels).
-    handle.stop().context("failed to stop streaming capture")?;
+    // Stop capture streams (closes raw channel -> pump threads will finish
+    // their loop and drop the utterance sender once their buffer drains).
+    handle.request_stop().context("failed to request stop on streaming capture")?;
 
-    // Drain anything still in the channel that arrived between Ctrl+C and stop.
+    // Drain remaining utterances so pumps can complete their blocking_send
+    // calls and exit cleanly. rx returns None when all senders are dropped.
     while let Some(chunk) = rx.recv().await {
         let task = spawn_transcribe(whisper.clone(), chunk, recording_started);
         transcribe_tasks.push(task);
     }
+
+    // Now safe to join pump threads -- channel drained, senders dropped.
+    handle
+        .await_completion()
+        .context("failed to await pump completion")?;
 
     println!("\n>>> Awaiting {} pending transcriptions... <<<", transcribe_tasks.len());
     for task in transcribe_tasks {
