@@ -176,6 +176,7 @@
     }
 
     .meeting-card {
+      position: relative;
       width: 100%;
       display: grid;
       gap: 8px;
@@ -185,12 +186,54 @@
       border-radius: 8px;
       text-align: left;
       color: var(--text);
+      cursor: pointer;
       box-shadow: 0 10px 26px rgba(20, 32, 48, 0.04);
+    }
+
+    .meeting-card:focus-visible {
+      outline: 2px solid var(--blue);
+      outline-offset: 2px;
     }
 
     .meeting-card:hover,
     .meeting-card.active {
       border-color: var(--blue);
+    }
+
+    .meeting-card .delete-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1;
+      opacity: 0;
+      transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+    }
+
+    .meeting-card:hover .delete-btn,
+    .meeting-card .delete-btn:focus {
+      opacity: 1;
+    }
+
+    .meeting-card .delete-btn:hover {
+      background: #fee4e2;
+      color: #b42318;
+      border-color: #fda29b;
+    }
+
+    .meeting-card .delete-btn[disabled] {
+      cursor: progress;
+      opacity: 0.6;
     }
 
     .meeting-title {
@@ -422,7 +465,8 @@
       }
 
       meetingList.innerHTML = state.meetings.map((meeting) => `
-        <button class="meeting-card ${meeting.id === state.selectedMeetingId ? "active" : ""}" data-meeting-id="${escapeHtml(meeting.id)}">
+        <div class="meeting-card ${meeting.id === state.selectedMeetingId ? "active" : ""}" data-meeting-id="${escapeHtml(meeting.id)}" role="button" tabindex="0">
+          <button type="button" class="delete-btn" data-delete-id="${escapeHtml(meeting.id)}" data-delete-title="${escapeHtml(meeting.title || "Untitled Meeting")}" aria-label="Delete meeting" title="Delete meeting">&times;</button>
           <div class="meeting-title">${escapeHtml(meeting.title || "Untitled Meeting")}</div>
           <div class="meeting-meta">
             <span>${escapeHtml(formatDate(meeting.created_at))}</span>
@@ -430,7 +474,7 @@
             <span class="pill">${meeting.segment_count} segments</span>
             ${meeting.has_summary ? '<span class="pill">summary</span>' : ""}
           </div>
-        </button>
+        </div>
       `).join("");
     }
 
@@ -506,9 +550,48 @@
       `).join("") : '<div class="result">No matching transcript segments.</div>';
     }
 
+    async function deleteMeeting(meetingId, title, btn) {
+      const confirmed = window.confirm(`Delete meeting "${title}"? This cannot be undone.`);
+      if (!confirmed) return;
+
+      if (btn) btn.disabled = true;
+      try {
+        const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}`, {
+          method: "DELETE"
+        });
+        if (response.status !== 204 && !response.ok) {
+          throw new Error(`Delete failed: ${response.status} ${response.statusText}`);
+        }
+
+        state.meetings = state.meetings.filter((m) => m.id !== meetingId);
+        if (state.selectedMeetingId === meetingId) {
+          state.selectedMeetingId = null;
+          detail.innerHTML = '<div class="empty-state">Select a meeting to view its transcript.</div>';
+        }
+        renderMeetings();
+      } catch (error) {
+        if (btn) btn.disabled = false;
+        showError(error);
+      }
+    }
+
     meetingList.addEventListener("click", (event) => {
+      const deleteBtn = event.target.closest("[data-delete-id]");
+      if (deleteBtn) {
+        event.stopPropagation();
+        deleteMeeting(deleteBtn.dataset.deleteId, deleteBtn.dataset.deleteTitle, deleteBtn).catch(showError);
+        return;
+      }
       const card = event.target.closest("[data-meeting-id]");
       if (card) selectMeeting(card.dataset.meetingId).catch(showError);
+    });
+
+    meetingList.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const card = event.target.closest("[data-meeting-id]");
+      if (!card || event.target.closest("[data-delete-id]")) return;
+      event.preventDefault();
+      selectMeeting(card.dataset.meetingId).catch(showError);
     });
 
     searchResults.addEventListener("click", (event) => {
