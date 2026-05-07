@@ -15,8 +15,11 @@
 //! - sample_rate: 16 kHz
 //!
 //! `max_speech_time` is enforced manually because the silero revision we
-//! pin doesn't expose it: when ongoing speech exceeds 30 s we slice off the
-//! leading window with `take_until()` and emit it as an utterance.
+//! pin doesn't expose it: when ongoing speech exceeds 30 s we snapshot the
+//! active speech buffer, emit the leading window as a forced utterance,
+//! and `reset()` the silero session. See the force-cut block in
+//! `Vad::process_frame` for the rationale (avoids a silero panic that
+//! `take_until` would trigger on subsequent natural SpeechEnd).
 
 use anyhow::{Context, Result};
 use silero::{VadConfig, VadSession, VadTransition};
@@ -60,10 +63,9 @@ impl Utterance {
 pub struct Vad {
     session: VadSession,
     /// Wall-clock start of the current speech segment, used to assign a
-    /// `start_ms` to force-emitted utterances. Reset on natural SpeechEnd.
-    /// On a forced emit we advance this by `MAX_UTTERANCE_MS` so subsequent
-    /// forced slices in the same continuous speech segment get monotonic
-    /// timestamps.
+    /// `start_ms` to force-emitted utterances. Cleared on natural SpeechEnd
+    /// and on a forced emit (since we `reset()` the session there, the next
+    /// segment will produce a fresh `SpeechStart` with its own timestamp).
     current_speech_start_ms: Option<u64>,
 }
 
