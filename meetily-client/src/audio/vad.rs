@@ -154,8 +154,21 @@ impl Vad {
                 let take = MAX_UTTERANCE_MS as usize * VAD_SAMPLE_RATE / 1000;
                 let take = take.min(active.len());
                 let forced_samples: Vec<f32> = active[..take].to_vec();
-                let start_ms = self.current_speech_start_ms.unwrap_or(0);
-                let end_ms = start_ms + MAX_UTTERANCE_MS;
+                // Derive start_ms defensively. If for any reason
+                // `current_speech_start_ms` is unset while silero claims
+                // is_speaking, fall back to (session_time - speech_dur).
+                let start_ms = self.current_speech_start_ms.unwrap_or_else(|| {
+                    self.session
+                        .session_time()
+                        .saturating_sub(speech_dur)
+                        .as_millis() as u64
+                });
+                // Compute end_ms from actual sample count, not the request,
+                // so a short forced_samples (e.g. silero/get_current_speech
+                // length disagrees with current_speech_duration) still
+                // produces a consistent timestamp.
+                let dur_ms = (forced_samples.len() as u64) * 1000 / VAD_SAMPLE_RATE as u64;
+                let end_ms = start_ms + dur_ms;
                 self.session.reset();
                 self.current_speech_start_ms = None;
                 if forced_samples.len() >= MIN_UTTERANCE_SAMPLES {
