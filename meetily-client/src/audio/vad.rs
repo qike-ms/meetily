@@ -126,34 +126,45 @@ impl Vad {
         }
 
         // Force-emit if currently speaking and the live speech buffer has
-        // grown beyond MAX_UTTERANCE_MS. `take_until(end)` interprets `end`
-        // as absolute session time (per silero source) and trims the front
-        // of the active speech buffer, advancing speech_start_ms internally
-        // so the residual buffer remains continuous.
+        // grown beyond MAX_UTTERANCE_MS.
         //
-        // Slice we want = first MAX_UTTERANCE_MS of the *current* speech.
-        // Target session time for take_until = session_time - (current_speech_duration - MAX).
+        // We deliberately do NOT use `take_until` here. silero rev 26a6460
+        // updates an internal `speech_start_ms` field on `take_until`, but
+        // does NOT update the `start_ms` carried inside `VadState::Speech`.
+        // When the segment eventually ends naturally, silero computes
+        // `unchecked_duration_to_index(VadState::Speech.start_ms)`, which is
+        // now before `deleted_samples` and panics inside the silero process
+        // loop, killing the pump. Verified against
+        // ~/.cargo/git/.../silero-rs/26a6460/src/lib.rs lines 311-358, 440-458.
+        //
+        // Safe alternative: snapshot the active speech buffer, emit the
+        // first MAX_UTTERANCE_MS as a forced utterance, then `reset()` the
+        // session. `reset()` clears LSTM state + marks state Silence but
+        // does not clear `session_audio`/`processed_samples`, so subsequent
+        // frames still produce correct timestamps. Trade-off: any audio in
+        // the live buffer beyond MAX_UTTERANCE_MS (the trailing tail of a
+        // continuous monologue past the 30s mark) is dropped until the next
+        // SpeechStart is detected. For 30s force-cuts this is rare and far
+        // preferable to a panic.
         if self.session.is_speaking() {
             let speech_dur = self.session.current_speech_duration();
             let max = Duration::from_millis(MAX_UTTERANCE_MS);
             if speech_dur >= max {
-                let session_time = self.session.session_time();
-                let cut_to = session_time
-                    .saturating_sub(speech_dur.saturating_sub(max));
-                let forced_samples = self.session.take_until(cut_to);
+                let active = self.session.get_current_speech();
+                let take = MAX_UTTERANCE_MS as usize * VAD_SAMPLE_RATE / 1000;
+                let take = take.min(active.len());
+                let forced_samples: Vec<f32> = active[..take].to_vec();
+                let start_ms = self.current_speech_start_ms.unwrap_or(0);
+                let end_ms = start_ms + MAX_UTTERANCE_MS;
+                self.session.reset();
+                self.current_speech_start_ms = None;
                 if forced_samples.len() >= MIN_UTTERANCE_SAMPLES {
-                    let start_ms = self.current_speech_start_ms.unwrap_or(0);
-                    let end_ms = start_ms + MAX_UTTERANCE_MS;
                     utterances.push(Utterance {
                         samples: forced_samples,
                         start_ms,
                         end_ms,
                         forced: true,
                     });
-                    // Advance the logical start so subsequent forced slices
-                    // in the same continuous speech segment have monotonic
-                    // timestamps.
-                    self.current_speech_start_ms = Some(end_ms);
                 }
             }
         }
