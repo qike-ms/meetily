@@ -43,7 +43,31 @@ pub fn transcribe_wav(
     if samples.is_empty() {
         return Ok(Vec::new());
     }
+    transcribe_samples(&samples, ctx, source_tag, 0.0)
+}
 
+/// Transcribe a single VAD-extracted utterance (mono f32 @ 16 kHz).
+///
+/// `wall_clock_offset_seconds` shifts the produced segment timestamps onto
+/// the recording's wall clock so they line up across mic + system streams.
+pub fn transcribe_chunk(
+    samples: &[f32],
+    ctx: &WhisperContext,
+    source_tag: &str,
+    wall_clock_offset_seconds: f64,
+) -> Result<Vec<TranscriptSegment>> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    transcribe_samples(samples, ctx, source_tag, wall_clock_offset_seconds)
+}
+
+fn transcribe_samples(
+    samples: &[f32],
+    ctx: &WhisperContext,
+    source_tag: &str,
+    wall_clock_offset_seconds: f64,
+) -> Result<Vec<TranscriptSegment>> {
     let mut state = ctx.create_state()?;
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
         beam_size: 5,
@@ -60,7 +84,7 @@ pub fn transcribe_wav(
     params.set_no_speech_thold(0.55);
     params.set_single_segment(false);
 
-    state.full(params, &samples)?;
+    state.full(params, samples)?;
     let segment_count = state.full_n_segments()?;
     let mut segments = Vec::new();
 
@@ -75,8 +99,8 @@ pub fn transcribe_wav(
             .full_get_segment_t1(index)
             .unwrap_or(start as i64)
             .max(start as i64) as u64;
-        let start_seconds = start as f64 / 100.0;
-        let end_seconds = end as f64 / 100.0;
+        let start_seconds = start as f64 / 100.0 + wall_clock_offset_seconds;
+        let end_seconds = end as f64 / 100.0 + wall_clock_offset_seconds;
         let duration = (end_seconds - start_seconds).max(0.0);
 
         segments.push(TranscriptSegment {
