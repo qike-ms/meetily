@@ -1,0 +1,13 @@
+[package]
+name = "meetily-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Shared audio capture, DSP, and AEC primitives for meetily clients"
+
+[dependencies]
+anyhow = { workspace = true }
+futures = "0.3"
+tokio = { workspace = true }
+
+[dev-dependencies]
+trybuild = "1.0"

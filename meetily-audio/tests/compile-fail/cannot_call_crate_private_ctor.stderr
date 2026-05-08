@@ -1,0 +1,10 @@
+error[E0624]: associated function `from_mic_capture` is private
+ --> tests/compile-fail/cannot_call_crate_private_ctor.rs:8:33
+  |
+8 |     let _ = TranscriptionFrame::from_mic_capture(vec![0.0; 160], 0);
+  |                                 ^^^^^^^^^^^^^^^^ private associated function
+  |
+ ::: src/source.rs
+  |
+  |     pub(crate) fn from_mic_capture(samples: Vec<f32>, timestamp_ms: u64) -> Self {
+  |     ---------------------------------------------------------------------------- private associated function defined here
