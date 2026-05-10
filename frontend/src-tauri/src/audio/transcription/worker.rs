@@ -142,6 +142,18 @@ pub fn start_transcription_task<R: Runtime>(
 
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
+                            // Capture the device_type BEFORE moving chunk
+                            // into transcribe_chunk_with_provider so we can
+                            // stamp the per-source label on the resulting
+                            // TranscriptUpdate. Tauri-Unmix (#57): worker
+                            // emits "mic" / "system" instead of legacy
+                            // "Audio" — the upstream pipeline (per-source
+                            // VAD) is the source of truth.
+                            let chunk_source_label = match chunk.device_type {
+                                crate::audio::recording_state::DeviceType::Microphone => "mic",
+                                crate::audio::recording_state::DeviceType::System => "system",
+                            }
+                            .to_string();
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -208,7 +220,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         let update = TranscriptUpdate {
                                             text: transcript,
                                             timestamp: format_current_timestamp(), // Wall-clock for reference
-                                            source: "Audio".to_string(),
+                                            source: chunk_source_label.clone(),
                                             sequence_id,
                                             chunk_start_time: chunk_timestamp, // Legacy compatibility
                                             is_partial,

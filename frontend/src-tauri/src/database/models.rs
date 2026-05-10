@@ -35,6 +35,11 @@ pub struct Transcript {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
+    /// Per-source label, "mic" or "system" (Tauri-Unmix #57). Stored in
+    /// the `speaker` column added by migration 20251110000001 (which was
+    /// previously unwired). Optional because pre-unmix transcripts wrote
+    /// NULL — UI renders unknown sources with neutral styling.
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

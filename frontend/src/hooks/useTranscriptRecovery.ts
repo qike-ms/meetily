@@ -171,6 +171,13 @@ export function useTranscriptRecovery(): UseTranscriptRecoveryReturn {
         audio_start_time: (t as any).audio_start_time,
         audio_end_time: (t as any).audio_end_time,
         duration: (t as any).duration,
+        // Tauri-Unmix #57: preserve per-source label across crash
+        // recovery so SQLite write keeps `speaker` populated. Same
+        // narrowing as TranscriptContext: legacy 'Audio' → null.
+        source:
+          (t as any).source === 'mic' || (t as any).source === 'system'
+            ? (t as any).source
+            : null,
       }));
 
       // 6. Save to backend database using existing save utilities
