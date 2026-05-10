@@ -223,11 +223,15 @@ pub enum SystemBackend {
 /// The handle must be stopped when the user is done — drop is not enough
 /// because cpal streams hold OS resources and writer threads must drain.
 /// `system_backend` selects the system-audio capture mechanism (see
-/// [`SystemBackend`]).
+/// [`SystemBackend`]). `enable_aec` enables WebRTC AEC3 between the
+/// resampler and VAD on the mic path; system audio is tee'd into the AEC
+/// as the far-end reference. Requires the `aec` Cargo feature; ignored
+/// otherwise.
 pub fn record_streaming(
     mic_device: Option<String>,
     system_device: Option<String>,
     system_backend: SystemBackend,
+    enable_aec: bool,
 ) -> Result<(StreamingHandle, mpsc::Receiver<StreamingChunk>)> {
     let (utt_tx, utt_rx) = mpsc::channel::<StreamingChunk>(STREAM_UTTERANCE_CAPACITY);
 
@@ -236,12 +240,42 @@ pub fn record_streaming(
             .context("failed to start streaming mic capture")?;
     mic_capture.play().context("failed to play mic stream")?;
 
+    // Build the AEC roles. With AEC enabled and a system source available,
+    // we set up a render-tee channel. Without either, both pumps run with
+    // AecRole::None.
+    let want_system = !matches!((system_device.as_deref(), system_backend), (None, SystemBackend::Cpal));
+    #[cfg(feature = "aec")]
+    let (mic_role, system_role) = if enable_aec && want_system {
+        // Bounded render tee. Capacity sized to ~2 s of 30 ms frames at
+        // 16 kHz mono = 64 frames. Per the sonora-aec3 wrapper rustdoc,
+        // overflow → drop the *newest* render frame (sync_channel::try_send
+        // semantics) + bump AecMetrics::render_drops; sonora's
+        // RenderDelayController re-estimates on the next aligned audio.
+        let (render_tx, render_rx) = sync_channel::<Vec<f32>>(64);
+        let render_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let aec = meetily_audio::aec::AecPipeline::new(16_000)
+            .context("failed to initialize AecPipeline")?;
+        (
+            AecRole::Mic { aec, render_rx, render_drops: render_drops.clone() },
+            AecRole::System { render_tx, render_drops },
+        )
+    } else {
+        (AecRole::None, AecRole::None)
+    };
+    #[cfg(not(feature = "aec"))]
+    let (mic_role, system_role) = {
+        let _ = enable_aec;
+        let _ = want_system;
+        (AecRole::None, AecRole::None)
+    };
+
     let mic_pump = spawn_pump_thread(
         StreamSource::Mic,
         mic_raw_rx,
         mic_rate,
         mic_channels,
         utt_tx.clone(),
+        mic_role,
     )?;
 
     let (system_capture, system_pump) = match (system_device.as_deref(), system_backend) {
@@ -256,14 +290,28 @@ pub fn record_streaming(
                 start_streaming_capture(system_device.as_deref(), false)
                     .context("failed to start streaming system capture")?;
             cap.play().context("failed to play system stream")?;
-            let pump = spawn_pump_thread(StreamSource::System, raw_rx, rate, channels, utt_tx)?;
+            let pump = spawn_pump_thread(
+                StreamSource::System,
+                raw_rx,
+                rate,
+                channels,
+                utt_tx,
+                system_role,
+            )?;
             (Some(cap), Some(pump))
         }
         (_, SystemBackend::CoreAudio) => {
             let (cap, raw_rx, rate, channels) = start_streaming_capture_coreaudio()
                 .context("failed to start CoreAudio system capture")?;
             cap.play().context("failed to play CoreAudio system stream")?;
-            let pump = spawn_pump_thread(StreamSource::System, raw_rx, rate, channels, utt_tx)?;
+            let pump = spawn_pump_thread(
+                StreamSource::System,
+                raw_rx,
+                rate,
+                channels,
+                utt_tx,
+                system_role,
+            )?;
             (Some(cap), Some(pump))
         }
     };
@@ -397,47 +445,172 @@ fn start_streaming_capture_coreaudio()
     ))
 }
 
+/// Per-pump AEC wiring.
+///
+/// `Mic` owns the [`AecPipeline`] and consumes render-side resampled chunks
+/// produced by the system pump. `System` is the source side: after
+/// resampling each 30 ms frame is also pushed to `render_tx` so the mic
+/// pump can `ingest_render` them. On render-tee overflow the system pump
+/// bumps `render_drops` and drops the incoming (newest) write — see
+/// [`AecPipeline`] rustdoc §"Drop semantics" for the design rationale.
+#[cfg(feature = "aec")]
+enum AecRole {
+    None,
+    Mic {
+        aec: meetily_audio::aec::AecPipeline,
+        render_rx: Receiver<Vec<f32>>,
+        render_drops: Arc<std::sync::atomic::AtomicU64>,
+    },
+    System {
+        render_tx: SyncSender<Vec<f32>>,
+        render_drops: Arc<std::sync::atomic::AtomicU64>,
+    },
+}
+
+#[cfg(not(feature = "aec"))]
+enum AecRole {
+    None,
+}
+
 fn spawn_pump_thread(
     source: StreamSource,
     raw_rx: Receiver<RawAudioMessage>,
     input_rate: u32,
     input_channels: u16,
     utt_tx: mpsc::Sender<StreamingChunk>,
+    aec_role: AecRole,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let mut resampler = Resampler16k::new(input_rate, input_channels)
         .with_context(|| format!("failed to init resampler for {}", source.as_str()))?;
     let mut vad = Vad::new()
         .with_context(|| format!("failed to init VAD for {}", source.as_str()))?;
 
+    // Post-AEC accumulator: AEC operates in 4 ms / 64-sample blocks while
+    // VAD wants exactly VAD_FRAME_SAMPLES (480 = 30 ms) per call. AEC
+    // output length per call is not a multiple of 480, so we buffer here
+    // and drain in 480-sample windows. Without this accumulator, ~50% of
+    // mic audio is lost on the AEC path (codex round 1 blocker fix).
+    let mut vad_acc: Vec<f32> = Vec::with_capacity(meetily_audio::vad::VAD_FRAME_SAMPLES * 4);
+
     let handle = thread::Builder::new()
         .name(format!("meetily-pump-{}", source.as_str()))
         .spawn(move || -> Result<()> {
+            #[cfg(feature = "aec")]
+            let mut aec_role = aec_role;
+            #[cfg(not(feature = "aec"))]
+            let _ = aec_role;
+
             // Drain raw audio until the producer (cpal stream) is dropped.
             while let Ok(RawAudioMessage(samples)) = raw_rx.recv() {
                 let frames = resampler.push(&samples).with_context(|| {
                     format!("resampler failed for {}", source.as_str())
                 })?;
                 for frame in frames {
-                    let utts = vad
-                        .process_frame(&frame)
-                        .with_context(|| format!("vad failed for {}", source.as_str()))?;
-                    for utterance in utts {
-                        let chunk = StreamingChunk { source, utterance };
-                        if utt_tx.blocking_send(chunk).is_err() {
-                            log::debug!(
-                                "{} pump: receiver dropped, exiting",
-                                source.as_str()
-                            );
-                            return Ok(());
+                    // AEC wiring (feature-gated):
+                    //  - Mic: drain any pending render-tee chunks into the
+                    //    AecPipeline, propagate any system-side drops to the
+                    //    AEC's metric counter, then run the mic frame through
+                    //    AEC before VAD.
+                    //  - System: tee the resampled frame to the mic pump.
+                    //  - None: passthrough.
+                    let processed_frame: Vec<f32>;
+                    #[cfg(feature = "aec")]
+                    {
+                        match &mut aec_role {
+                            AecRole::Mic { aec, render_rx, render_drops } => {
+                                while let Ok(render_chunk) = render_rx.try_recv() {
+                                    aec.ingest_render(&render_chunk);
+                                }
+                                let drops = render_drops.swap(
+                                    0,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                for _ in 0..drops {
+                                    aec.record_render_drop();
+                                }
+                                let out = aec.process_capture(&frame);
+                                // AEC emits 4 ms blocks; the VAD frame size
+                                // is 30 ms (480 samples). The aec output for
+                                // a 480-sample input is 480 samples (since
+                                // 480 = 7×64 + 32, so the AEC may withhold
+                                // up to 63 samples — we still pass whatever
+                                // is ready; VAD's internal buffering already
+                                // tolerates frame-size mismatches). If `out`
+                                // is empty (warm-up), skip VAD this round.
+                                if out.is_empty() {
+                                    continue;
+                                }
+                                processed_frame = out;
+                            }
+                            AecRole::System { render_tx, render_drops } => {
+                                if let Err(e) = render_tx.try_send(frame.clone()) {
+                                    if matches!(e, TrySendError::Full(_)) {
+                                        render_drops.fetch_add(
+                                            1,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                    // Disconnected = mic pump exited; we
+                                    // continue running our own VAD/Whisper path
+                                    // until the cpal channel closes.
+                                }
+                                processed_frame = frame;
+                            }
+                            AecRole::None => {
+                                processed_frame = frame;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "aec"))]
+                    {
+                        processed_frame = frame;
+                    }
+
+                    // Some VADs don't accept arbitrary block sizes; meetily's
+                    // wrapper expects exactly VAD_FRAME_SAMPLES per call. The
+                    // 30 ms-aligned frames from Resampler16k always satisfy
+                    // that on the passthrough / system path. On the mic+AEC
+                    // path AEC output length per call is not a multiple of
+                    // 480, so we accumulate and drain.
+                    vad_acc.extend_from_slice(&processed_frame);
+                    while vad_acc.len() >= meetily_audio::vad::VAD_FRAME_SAMPLES {
+                        let vad_frame: Vec<f32> = vad_acc
+                            .drain(..meetily_audio::vad::VAD_FRAME_SAMPLES)
+                            .collect();
+                        let utts = vad
+                            .process_frame(&vad_frame)
+                            .with_context(|| format!("vad failed for {}", source.as_str()))?;
+                        for utterance in utts {
+                            let chunk = StreamingChunk { source, utterance };
+                            if utt_tx.blocking_send(chunk).is_err() {
+                                log::debug!(
+                                    "{} pump: receiver dropped, exiting",
+                                    source.as_str()
+                                );
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
 
-            // Stream ended -- flush any in-progress utterance by feeding
-            // enough silence (redemption_time + post_speech_pad + slack ~=
-            // 1 s @ 16 kHz) so VAD emits a SpeechEnd for whatever speech
-            // was in flight when the user stopped recording.
+            // Stream ended -- pad any remaining vad_acc residue with zeros
+            // up to a full VAD frame so we don't lose the last few hundred
+            // samples on shutdown, then run the standard 1 s silence flush
+            // so the VAD emits SpeechEnd for any in-progress utterance.
+            if !vad_acc.is_empty() {
+                vad_acc.resize(meetily_audio::vad::VAD_FRAME_SAMPLES, 0.0);
+                let utts = vad
+                    .process_frame(&vad_acc)
+                    .with_context(|| format!("vad final partial flush failed for {}", source.as_str()))?;
+                for utterance in utts {
+                    let chunk = StreamingChunk { source, utterance };
+                    if utt_tx.blocking_send(chunk).is_err() {
+                        return Ok(());
+                    }
+                }
+                vad_acc.clear();
+            }
             let silence_frame = vec![0.0f32; meetily_audio::vad::VAD_FRAME_SAMPLES];
             let flush_frames = (meetily_audio::vad::VAD_SAMPLE_RATE / meetily_audio::vad::VAD_FRAME_SAMPLES) + 1;
             for _ in 0..flush_frames {
@@ -456,6 +629,7 @@ fn spawn_pump_thread(
         .context("failed to spawn pump thread")?;
     Ok(handle)
 }
+
 
 fn start_streaming_capture(
     device_name: Option<&str>,
