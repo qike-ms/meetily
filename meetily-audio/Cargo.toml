@@ -7,7 +7,10 @@ description = "Shared audio capture, DSP, and AEC primitives for meetily clients
 [dependencies]
 anyhow = { workspace = true }
 futures = "0.3"
+log = "0.4"
 tokio = { workspace = true }
+silero = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", features = ["static-model"] }
+rubato = "0.15"
 
 [dev-dependencies]
 trybuild = "1.0"

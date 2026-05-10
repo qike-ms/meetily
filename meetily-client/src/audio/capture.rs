@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::resample::Resampler16k;
-use super::vad::{Utterance, Vad};
+use meetily_audio::resample::Resampler16k;
+use meetily_audio::vad::{Utterance, Vad};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_CHANNEL_CAPACITY: usize = 16_384;
@@ -272,8 +272,8 @@ fn spawn_pump_thread(
             // enough silence (redemption_time + post_speech_pad + slack ~=
             // 1 s @ 16 kHz) so VAD emits a SpeechEnd for whatever speech
             // was in flight when the user stopped recording.
-            let silence_frame = vec![0.0f32; super::vad::VAD_FRAME_SAMPLES];
-            let flush_frames = (super::vad::VAD_SAMPLE_RATE / super::vad::VAD_FRAME_SAMPLES) + 1;
+            let silence_frame = vec![0.0f32; meetily_audio::vad::VAD_FRAME_SAMPLES];
+            let flush_frames = (meetily_audio::vad::VAD_SAMPLE_RATE / meetily_audio::vad::VAD_FRAME_SAMPLES) + 1;
             for _ in 0..flush_frames {
                 let utts = vad
                     .process_frame(&silence_frame)
