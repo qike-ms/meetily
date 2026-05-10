@@ -4,8 +4,12 @@ pub mod microphone;
 pub mod system;
 pub mod backend_config;
 
+// Core Audio Tap (macOS system-audio capture) lives in the shared
+// `meetily-audio` crate behind the `coreaudio` feature. Re-export under the
+// previous path so existing call sites (e.g. `super::capture::CoreAudioCapture`)
+// continue to work unchanged.
 #[cfg(target_os = "macos")]
-pub mod core_audio;
+pub use meetily_audio::capture::core_audio;
 
 // Re-export capture functionality
 pub use system::{
@@ -15,7 +19,7 @@ pub use system::{
 };
 
 #[cfg(target_os = "macos")]
-pub use core_audio::{CoreAudioCapture, CoreAudioStream};
+pub use meetily_audio::capture::core_audio::{CoreAudioCapture, CoreAudioStream};
 
 // Re-export backend configuration
 pub use backend_config::{

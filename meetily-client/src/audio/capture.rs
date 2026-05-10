@@ -4,6 +4,7 @@ use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -136,20 +137,30 @@ struct ActiveCapture {
     sender: Option<SyncSender<WriterMessage>>,
     writer_thread: Option<JoinHandle<Result<()>>>,
     raw_sender: Option<SyncSender<RawAudioMessage>>,
+    /// CoreAudio backend uses a forwarding thread (cidre Stream -> sync mpsc).
+    /// `play()` is a no-op for CoreAudio (the device is already streaming);
+    /// `stop()` flips this flag and joins the thread.
+    core_audio_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    core_audio_thread: Option<JoinHandle<Result<()>>>,
 }
 
 impl ActiveCapture {
     fn play(&self) -> Result<()> {
-        self.stream
-            .as_ref()
-            .context("audio stream already stopped")?
-            .play()
-            .context("failed to play audio stream")
+        if let Some(stream) = self.stream.as_ref() {
+            stream.play().context("failed to play audio stream")?;
+        }
+        // CoreAudio devices are already running by the time the forwarding
+        // thread is spawned -- nothing to play().
+        Ok(())
     }
 
     fn stop(mut self) -> Result<()> {
         // Drop the cpal stream first so no more samples are pushed.
         self.stream.take();
+        // Signal the CoreAudio forwarder to exit if any.
+        if let Some(stop_flag) = self.core_audio_stop.take() {
+            stop_flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Some(sender) = self.sender.take() {
             // Best-effort Finish; falling out of scope drops the sender too.
             let _ = sender.send(WriterMessage::Finish);
@@ -168,6 +179,10 @@ impl ActiveCapture {
                 .join()
                 .map_err(|_| anyhow!("audio writer thread panicked"))??;
         }
+        if let Some(t) = self.core_audio_thread.take() {
+            t.join()
+                .map_err(|_| anyhow!("CoreAudio forwarder thread panicked"))??;
+        }
         Ok(())
     }
 }
@@ -183,14 +198,36 @@ enum WriterMessage {
 /// don't want the producer to ever block trying to enqueue a sentinel.
 struct RawAudioMessage(Vec<f32>);
 
+/// Selects the system-audio capture backend.
+///
+/// `Cpal` is the cross-platform default — uses cpal default-output loopback,
+/// which on macOS requires a virtual audio device (BlackHole or Multi-Output
+/// Device).
+///
+/// `CoreAudio` (macOS only) uses Apple's native Core Audio Tap (macOS 14.2+),
+/// avoiding the need for any third-party audio driver. Requires
+/// `NSAudioCaptureUsageDescription` in the bundle's Info.plist for permission
+/// prompting. The `--system <device>` argument is ignored — Core Audio Tap
+/// captures the global default-output mix directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SystemBackend {
+    #[default]
+    Cpal,
+    CoreAudio,
+}
+
 /// Start a streaming dual-source capture: mic (always) and optionally system.
 /// Each captured speech utterance is pushed to the returned mpsc receiver.
 ///
 /// The handle must be stopped when the user is done — drop is not enough
 /// because cpal streams hold OS resources and writer threads must drain.
+/// `system_backend` selects the system-audio capture mechanism (see
+/// [`SystemBackend`]).
 pub fn record_streaming(
     mic_device: Option<String>,
     system_device: Option<String>,
+    system_backend: SystemBackend,
 ) -> Result<(StreamingHandle, mpsc::Receiver<StreamingChunk>)> {
     let (utt_tx, utt_rx) = mpsc::channel::<StreamingChunk>(STREAM_UTTERANCE_CAPACITY);
 
@@ -207,17 +244,28 @@ pub fn record_streaming(
         utt_tx.clone(),
     )?;
 
-    let (system_capture, system_pump) = if system_device.is_some() {
-        let (cap, raw_rx, rate, channels) =
-            start_streaming_capture(system_device.as_deref(), false)
-                .context("failed to start streaming system capture")?;
-        cap.play().context("failed to play system stream")?;
-        let pump = spawn_pump_thread(StreamSource::System, raw_rx, rate, channels, utt_tx)?;
-        (Some(cap), Some(pump))
-    } else {
-        // Drop the cloned sender to allow rx to close once mic pump exits.
-        drop(utt_tx);
-        (None, None)
+    let (system_capture, system_pump) = match (system_device.as_deref(), system_backend) {
+        (None, SystemBackend::Cpal) => {
+            // No system audio requested. Drop the cloned sender to allow rx
+            // to close once mic pump exits.
+            drop(utt_tx);
+            (None, None)
+        }
+        (_, SystemBackend::Cpal) => {
+            let (cap, raw_rx, rate, channels) =
+                start_streaming_capture(system_device.as_deref(), false)
+                    .context("failed to start streaming system capture")?;
+            cap.play().context("failed to play system stream")?;
+            let pump = spawn_pump_thread(StreamSource::System, raw_rx, rate, channels, utt_tx)?;
+            (Some(cap), Some(pump))
+        }
+        (_, SystemBackend::CoreAudio) => {
+            let (cap, raw_rx, rate, channels) = start_streaming_capture_coreaudio()
+                .context("failed to start CoreAudio system capture")?;
+            cap.play().context("failed to play CoreAudio system stream")?;
+            let pump = spawn_pump_thread(StreamSource::System, raw_rx, rate, channels, utt_tx)?;
+            (Some(cap), Some(pump))
+        }
     };
 
     Ok((
@@ -228,6 +276,124 @@ pub fn record_streaming(
             system_pump,
         },
         utt_rx,
+    ))
+}
+
+/// Start a CoreAudio Tap (macOS 14.2+) system capture and forward its samples
+/// into a `RawAudioMessage` channel matching the cpal-streaming-capture shape.
+///
+/// The `coreaudio` Cargo feature on `meetily-audio` must be enabled (it is by
+/// default for macOS builds of this crate via the `coreaudio` feature on
+/// `meetily-client`). Returns an error on non-macOS platforms.
+#[cfg(all(target_os = "macos", feature = "coreaudio"))]
+fn start_streaming_capture_coreaudio()
+    -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+    use futures_util::StreamExt;
+
+    let capture = meetily_audio::capture::core_audio::CoreAudioCapture::new()
+        .context("failed to initialize CoreAudio capture")?;
+    let mut stream = capture
+        .stream()
+        .context("failed to start CoreAudio stream")?;
+
+    let input_rate = stream.sample_rate().max(1);
+    // CoreAudioCapture uses a mono global tap — single channel of f32.
+    let input_channels: u16 = 1;
+
+    let (raw_tx, raw_rx) = sync_channel::<RawAudioMessage>(AUDIO_CHANNEL_CAPACITY);
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag_thread = stop_flag.clone();
+
+    // The CoreAudio Stream is async (futures::Stream). Run it on a small
+    // single-thread tokio runtime inside a dedicated OS thread so we can
+    // forward batched samples synchronously into the bounded sync_channel
+    // that the existing pump thread already drains.
+    let raw_tx_for_thread = raw_tx.clone();
+    let thread = thread::Builder::new()
+        .name("meetily-coreaudio-fwd".to_string())
+        .spawn(move || -> Result<()> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build CoreAudio forwarder runtime")?;
+
+            // Batch single-sample stream output into ~10ms chunks (480 @ 48k)
+            // to amortize per-message overhead before handing to the pump.
+            // Note: AUDIO_CHANNEL_CAPACITY counts MESSAGES, not samples — at
+            // 480 samples/batch and ~100 batches/sec the channel can buffer
+            // ~16k batches ≈ 160s of audio before drop, far exceeding any
+            // realistic pump-side stall. Drop-on-Full is therefore a hard
+            // safety net, not a routine event.
+            const BATCH: usize = 480;
+            let mut buf: Vec<f32> = Vec::with_capacity(BATCH);
+
+            rt.block_on(async move {
+                while !stop_flag_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        stream.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(sample)) => {
+                            buf.push(sample);
+                            if buf.len() >= BATCH {
+                                let chunk = std::mem::replace(
+                                    &mut buf,
+                                    Vec::with_capacity(BATCH),
+                                );
+                                if let Err(e) = raw_tx_for_thread
+                                    .try_send(RawAudioMessage(chunk))
+                                {
+                                    match e {
+                                        TrySendError::Full(_) => {
+                                            log::warn!("CoreAudio fwd: pump backpressure, dropping batch");
+                                        }
+                                        TrySendError::Disconnected(_) => {
+                                            log::debug!("CoreAudio fwd: pump dropped, exiting");
+                                            return Ok::<(), anyhow::Error>(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            log::debug!("CoreAudio stream ended");
+                            break;
+                        }
+                        Err(_) => continue, // timeout: re-check stop flag
+                    }
+                }
+                // Flush trailing partial batch on shutdown.
+                if !buf.is_empty() {
+                    let _ = raw_tx_for_thread.try_send(RawAudioMessage(buf));
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+        .context("failed to spawn CoreAudio forwarder thread")?;
+
+    Ok((
+        ActiveCapture {
+            stream: None,
+            sender: None,
+            writer_thread: None,
+            raw_sender: Some(raw_tx),
+            core_audio_stop: Some(stop_flag),
+            core_audio_thread: Some(thread),
+        },
+        raw_rx,
+        input_rate,
+        input_channels,
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "coreaudio")))]
+fn start_streaming_capture_coreaudio()
+    -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+    Err(anyhow!(
+        "CoreAudio backend is only available on macOS with the `coreaudio` feature enabled"
     ))
 }
 
@@ -327,6 +493,8 @@ fn start_streaming_capture(
             sender: None,
             writer_thread: None,
             raw_sender: Some(raw_tx),
+            core_audio_stop: None,
+            core_audio_thread: None,
         },
         raw_rx,
         input_rate,
@@ -402,6 +570,8 @@ fn start_capture_stream(
         sender: Some(sender),
         writer_thread: Some(writer_thread),
         raw_sender: None,
+        core_audio_stop: None,
+        core_audio_thread: None,
     })
 }
 

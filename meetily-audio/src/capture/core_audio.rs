@@ -380,42 +380,10 @@ impl Drop for CoreAudioStream {
     }
 }
 
-// Stub implementations for non-macOS platforms
-#[cfg(not(target_os = "macos"))]
-pub struct CoreAudioCapture;
-
-#[cfg(not(target_os = "macos"))]
-pub struct CoreAudioStream;
-
-#[cfg(not(target_os = "macos"))]
-impl CoreAudioCapture {
-    pub fn new() -> Result<Self> {
-        Err(anyhow::anyhow!("Core Audio is only supported on macOS"))
-    }
-
-    pub fn stream(self) -> Result<CoreAudioStream> {
-        Err(anyhow::anyhow!("Core Audio is only supported on macOS"))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl CoreAudioStream {
-    pub fn sample_rate(&self) -> u32 {
-        0
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl Stream for CoreAudioStream {
-    type Item = f32;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        Poll::Ready(None)
-    }
-}
+// Stub implementations are no longer needed: this module is gated at the
+// `meetily_audio::capture` level by `cfg(all(target_os = "macos", feature =
+// "coreaudio"))`, so non-macOS or feature-disabled builds never see this
+// file.
 
 #[cfg(test)]
 mod tests {

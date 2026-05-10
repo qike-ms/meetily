@@ -3,6 +3,16 @@ name = "meetily-client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["coreaudio"]
+# Enable Apple Core Audio Tap system-audio capture (macOS 14.2+).
+# The feature is on by default to keep `meetily-client record --backend coreaudio`
+# discoverable on macOS without needing extra Cargo flags. The cidre native
+# code only compiles when target_os = "macos" (gated inside meetily-audio);
+# on Linux/Windows this just adds small pure-Rust optional deps
+# (futures-util, ringbuf).
+coreaudio = ["meetily-audio/coreaudio", "dep:futures-util"]
+
 [dependencies]
 meetily-audio = { path = "../meetily-audio" }
 tokio = { version = "1", features = ["full"] }
@@ -20,6 +30,7 @@ log = "0.4"
 env_logger = "0.11"
 dirs = "5"
 tokio-util = "0.7"
+futures-util = { version = "0.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.13", features = ["raw-api", "metal"] }
