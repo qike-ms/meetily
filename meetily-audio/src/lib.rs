@@ -20,10 +20,14 @@
 
 mod source;
 
+#[cfg(feature = "aec")]
+pub mod aec;
 pub mod capture;
 pub mod resample;
 pub mod vad;
 
+#[cfg(feature = "aec")]
+pub use aec::{AecMetrics, AecPipeline, AEC_BLOCK_SIZE};
 pub use resample::Resampler16k;
 pub use source::{AudioFrame, AudioSource, RecordingMixFrame, SourceLabel, TranscriptionFrame};
 pub use vad::{Utterance, Vad, MAX_UTTERANCE_MS, MIN_UTTERANCE_SAMPLES, VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE};

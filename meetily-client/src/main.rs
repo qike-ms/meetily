@@ -90,6 +90,15 @@ enum Commands {
         /// (`--streaming false`) always uses cpal regardless of this flag.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
+
+        /// Disable WebRTC AEC3 echo cancellation. Default: AEC enabled (when
+        /// the `aec` feature is compiled in, which is the default for this
+        /// crate). Use this for headphone users where there is no acoustic
+        /// echo to cancel — saves a few % CPU and avoids any chance of AEC
+        /// distorting clean mic audio. Only meaningful in streaming mode
+        /// with a system source; ignored otherwise.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+        no_aec: bool,
     },
     Devices,
     DownloadModel {
@@ -112,6 +121,7 @@ async fn main() -> Result<()> {
             model,
             streaming,
             backend,
+            no_aec,
         } => {
             // Resolve --backend now that we know the mode. Streaming uses the
             // platform default (CoreAudio on macOS 14.2+, cpal elsewhere) when
@@ -154,7 +164,7 @@ async fn main() -> Result<()> {
             println!("Model loaded.");
 
             let segments = if streaming {
-                run_streaming_session(mic, system, resolved_backend.into_system_backend(), whisper.clone()).await?
+                run_streaming_session(mic, system, resolved_backend.into_system_backend(), !no_aec, whisper.clone()).await?
             } else {
                 run_batch_session(mic, system, &whisper).await?
             };
@@ -196,11 +206,12 @@ async fn run_streaming_session(
     mic: Option<String>,
     system: Option<String>,
     system_backend: SystemBackend,
+    enable_aec: bool,
     whisper: Arc<WhisperContext>,
 ) -> Result<Vec<TranscriptSegment>> {
     println!("\n>>> Recording started (streaming VAD). Press Ctrl+C to stop. <<<\n");
 
-    let (mut handle, mut rx) = record_streaming(mic, system, system_backend).context("failed to start streaming capture")?;
+    let (mut handle, mut rx) = record_streaming(mic, system, system_backend, enable_aec).context("failed to start streaming capture")?;
     let recording_started = Instant::now();
     let stop = CancellationToken::new();
     let stop_for_signal = stop.clone();
