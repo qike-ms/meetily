@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Shared audio capture, DSP, and AEC primitives for meetily clients"
 
+[features]
+default = []
+# Enable the macOS Core Audio Tap system-audio capture backend (requires
+# macOS 14.2+ at runtime and the `NSAudioCaptureUsageDescription` Info.plist
+# key for permission). Pulls in cidre, ringbuf, futures-util.
+coreaudio = ["dep:cidre", "dep:ringbuf", "dep:futures-util"]
+
 [dependencies]
 anyhow = { workspace = true }
 futures = "0.3"
@@ -11,6 +18,11 @@ log = "0.4"
 tokio = { workspace = true }
 silero = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", features = ["static-model"] }
 rubato = "0.15"
+futures-util = { version = "0.3", optional = true }
+ringbuf = { version = "0.4.8", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre = { git = "https://github.com/yury/cidre", rev = "a9587fa", features = ["av"], optional = true }
 
 [dev-dependencies]
 trybuild = "1.0"
