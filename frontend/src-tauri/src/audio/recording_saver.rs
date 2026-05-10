@@ -22,6 +22,12 @@ pub struct TranscriptSegment {
     pub display_time: String,   // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
+    /// Per-source label: "mic" or "system" (Tauri-Unmix #57). May be the
+    /// legacy "Audio" string for transcripts produced by pre-unmix builds
+    /// that are loaded from disk; UI should treat unknown values as
+    /// neutral.
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Meeting metadata structure
@@ -129,6 +135,10 @@ impl RecordingSaver {
             display_time: "[00:00]".to_string(),
             confidence: 1.0,
             sequence_id: 0,
+            // Legacy entry-point: caller didn't supply a source. Use the
+            // historical "Audio" tag so old behavior is preserved
+            // verbatim.
+            source: "Audio".to_string(),
         };
         self.add_transcript_segment(segment);
     }

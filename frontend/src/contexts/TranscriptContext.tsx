@@ -315,6 +315,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: update.audio_start_time,
             audio_end_time: update.audio_end_time,
             duration: update.duration,
+            // NEW (Tauri-Unmix #57): per-source label. Narrow the wire-level
+            // string to 'mic' | 'system' | null. Pre-unmix builds emit
+            // 'Audio' which we map to null = neutral.
+            source:
+              update.source === 'mic' || update.source === 'system'
+                ? update.source
+                : null,
           };
 
           // Add to buffer
@@ -383,6 +390,13 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: segment.audio_start_time,
             audio_end_time: segment.audio_end_time,
             duration: segment.duration,
+            // NEW (Tauri-Unmix #57): per-source label from backend
+            // recording_saver::TranscriptSegment.source. Narrow to
+            // 'mic' | 'system' | null; legacy 'Audio' → null.
+            source:
+              segment.source === 'mic' || segment.source === 'system'
+                ? segment.source
+                : null,
           }));
 
           setTranscripts(formattedTranscripts);
@@ -424,6 +438,12 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       audio_start_time: update.audio_start_time,
       audio_end_time: update.audio_end_time,
       duration: update.duration,
+      // Narrow backend's `source` string to 'mic' | 'system'. Pre-unmix
+      // builds emit 'Audio' (mixed), which we map to null = neutral.
+      source:
+        update.source === 'mic' || update.source === 'system'
+          ? update.source
+          : null,
     };
 
     setTranscripts(prev => {

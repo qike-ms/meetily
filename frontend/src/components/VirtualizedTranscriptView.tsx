@@ -71,6 +71,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    source,
 }: {
     id: string;
     timestamp: number;
@@ -78,8 +79,18 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    source?: 'mic' | 'system' | null;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
+
+    // Per-source badge (Tauri-Unmix #57). 'mic' = local speaker (YOU,
+    // green); 'system' = remote/system audio (THEM, blue); null /
+    // unknown = neutral (legacy transcripts pre-unmix).
+    const sourceBadge = source === 'mic'
+        ? { label: 'YOU', className: 'bg-green-100 text-green-700 border-green-200' }
+        : source === 'system'
+            ? { label: 'THEM', className: 'bg-blue-100 text-blue-700 border-blue-200' }
+            : null;
 
     return (
         <div id={`segment-${id}`} className="mb-3">
@@ -96,6 +107,14 @@ const TranscriptSegment = memo(function TranscriptSegment({
                         )}
                     </TooltipContent>
                 </Tooltip>
+                {sourceBadge && (
+                    <span
+                        className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border mt-1 flex-shrink-0 ${sourceBadge.className}`}
+                        title={source === 'mic' ? 'Microphone' : 'System audio'}
+                    >
+                        {sourceBadge.label}
+                    </span>
+                )}
                 <div className="flex-1">
                     {isStreaming ? (
                         <div className="bg-gray-100 border border-gray-200 rounded-lg px-3 py-2">
@@ -296,6 +315,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        source={segment.source}
                                     />
                                 </div>
                             );
@@ -352,6 +372,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        source={segment.source}
                                     />
                                 </motion.div>
                             );
