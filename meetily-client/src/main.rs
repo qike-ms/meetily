@@ -188,12 +188,75 @@ async fn run_streaming_session(
         .await_completion()
         .context("failed to await pump completion")?;
 
-    println!("\n>>> Awaiting {} pending transcriptions... <<<", transcribe_tasks.len());
-    for task in transcribe_tasks {
-        match task.await {
-            Ok(Ok(mut segs)) => all_segments.append(&mut segs),
-            Ok(Err(err)) => log::warn!("transcribe task failed: {err:#}"),
-            Err(err) => log::warn!("transcribe join failed: {err:#}"),
+    // Drain pending transcriptions with a live progress counter and a
+    // second-Ctrl+C abort. Convert the Vec<JoinHandle> into a JoinSet so we
+    // can both `join_next()` and `abort_all()` in response to a second SIGINT.
+    let total = transcribe_tasks.len();
+    if total > 0 {
+        println!(
+            "\n>>> Transcribing {total} pending utterances... (Ctrl+C again within 2s to abort) <<<"
+        );
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for task in transcribe_tasks {
+            // Move the JoinHandle into the JoinSet by spawning a thin wrapper
+            // that awaits it. This adds one task layer but keeps the existing
+            // spawn_transcribe contract unchanged.
+            joinset.spawn(async move { task.await });
+        }
+
+        let mut completed = 0usize;
+        let mut dropped = 0usize;
+        let mut second_ctrlc = Box::pin(async {
+            // Listen for a second Ctrl+C. Tokio's signal handler stays
+            // installed across calls, so this fires on the next SIGINT.
+            let _ = tokio::signal::ctrl_c().await;
+        });
+
+        while !joinset.is_empty() {
+            tokio::select! {
+                _ = &mut second_ctrlc => {
+                    let remaining = joinset.len();
+                    println!(
+                        "\n>>> Second Ctrl+C: aborting {remaining} pending transcripts; flushing what we have. <<<"
+                    );
+                    joinset.abort_all();
+                    dropped = remaining;
+                    // Drain the abort errors so JoinSet exits cleanly.
+                    while let Some(_) = joinset.join_next().await {}
+                    break;
+                }
+                next = joinset.join_next() => {
+                    match next {
+                        Some(Ok(Ok(Ok(mut segs)))) => {
+                            all_segments.append(&mut segs);
+                            completed += 1;
+                            println!(
+                                ">>> Transcribed {completed}/{total} ({} pending) <<<",
+                                joinset.len()
+                            );
+                        }
+                        Some(Ok(Ok(Err(err)))) => {
+                            log::warn!("transcribe task failed: {err:#}");
+                            completed += 1;
+                        }
+                        Some(Ok(Err(err))) => {
+                            log::warn!("transcribe join failed: {err:#}");
+                            completed += 1;
+                        }
+                        Some(Err(err)) => {
+                            // JoinSet's outer task panicked or was cancelled.
+                            log::warn!("transcribe wrapper task failed: {err:#}");
+                            completed += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        if dropped > 0 {
+            println!(">>> Drained {completed}/{total} transcripts; {dropped} dropped on user abort. <<<");
         }
     }
 
