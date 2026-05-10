@@ -30,6 +30,22 @@ impl BackendArg {
             BackendArg::Coreaudio => SystemBackend::CoreAudio,
         }
     }
+
+    /// Per-platform default backend.
+    ///
+    /// macOS (with the `coreaudio` feature compiled in, which is the default
+    /// for this crate): CoreAudio Tap — no third-party audio driver required
+    /// on macOS 14.2+. Other platforms / feature-disabled builds: cpal.
+    fn platform_default() -> Self {
+        #[cfg(all(target_os = "macos", feature = "coreaudio"))]
+        {
+            BackendArg::Coreaudio
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreaudio")))]
+        {
+            BackendArg::Cpal
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -63,14 +79,17 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         streaming: bool,
 
-        /// System-audio capture backend. `cpal` (default) uses the cross-platform
-        /// cpal default-output loopback (requires BlackHole / Multi-Output Device
-        /// on macOS, and uses the device named by `--system`). `coreaudio` uses
-        /// Apple's native Core Audio Tap on macOS 14.2+ — no third-party drivers
-        /// required and `--system` is ignored (taps the default output mix).
-        /// Currently only honored in streaming mode (`--streaming true`).
-        #[arg(long, value_enum, default_value_t = BackendArg::Cpal)]
-        backend: BackendArg,
+        /// System-audio capture backend. On macOS 14.2+ (with the `coreaudio`
+        /// feature, on by default) this defaults to `coreaudio` — Apple's
+        /// native Core Audio Tap, no third-party drivers required and
+        /// `--system` is ignored (taps the default output mix). Set
+        /// `--backend cpal` to use the legacy cross-platform cpal
+        /// default-output loopback path (requires BlackHole / Multi-Output
+        /// Device on macOS, and uses the device named by `--system`).
+        /// On non-macOS platforms the default is `cpal`. Batch mode
+        /// (`--streaming false`) always uses cpal regardless of this flag.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
     },
     Devices,
     DownloadModel {
@@ -94,13 +113,21 @@ async fn main() -> Result<()> {
             streaming,
             backend,
         } => {
-            // Validate flag combos before doing any I/O.
-            if !streaming && matches!(backend, BackendArg::Coreaudio) {
-                anyhow::bail!(
-                    "--backend coreaudio is only supported in streaming mode. \
-                     Either drop --streaming false or omit --backend."
-                );
-            }
+            // Resolve --backend now that we know the mode. Streaming uses the
+            // platform default (CoreAudio on macOS 14.2+, cpal elsewhere) when
+            // not specified; batch mode is cpal-only and rejects an explicit
+            // --backend coreaudio.
+            let resolved_backend = if streaming {
+                backend.unwrap_or_else(BackendArg::platform_default)
+            } else {
+                if matches!(backend, Some(BackendArg::Coreaudio)) {
+                    anyhow::bail!(
+                        "--backend coreaudio is only supported in streaming mode. \
+                         Drop --streaming false or use --backend cpal."
+                    );
+                }
+                BackendArg::Cpal
+            };
 
             println!("\n=== Meetily Client ===");
             println!("Available audio devices:");
@@ -127,7 +154,7 @@ async fn main() -> Result<()> {
             println!("Model loaded.");
 
             let segments = if streaming {
-                run_streaming_session(mic, system, backend.into_system_backend(), whisper.clone()).await?
+                run_streaming_session(mic, system, resolved_backend.into_system_backend(), whisper.clone()).await?
             } else {
                 run_batch_session(mic, system, &whisper).await?
             };

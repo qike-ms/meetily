@@ -135,7 +135,7 @@ Audio pipeline emits real-time metrics (buffer sizes, mixing window count, VAD d
 
 ## Platform notes
 
-- **macOS**: ScreenCaptureKit for system audio (requires **macOS 13+** AND screen recording permission). Mic permission separate. System capture needs virtual audio device (BlackHole). Metal + CoreML auto.
+- **macOS**: System audio captured via **Apple Core Audio Tap** on **macOS 14.2+** in both the Tauri desktop app (default) and the `meetily-client` CLI (default; pass `--backend cpal` to fall back to the legacy cpal default-output loopback path that requires BlackHole + Multi-Output Device). `NSAudioCaptureUsageDescription` Info.plist key prompts for permission. Mic permission separate. ScreenCaptureKit (macOS 13+, requires screen recording permission) remains an alternate path. Metal + CoreML auto.
 - **Windows**: WASAPI for capture (loopback for system audio). WASAPI exclusive mode can conflict with other apps. Build needs Visual Studio Build Tools with C++ workload. CUDA (NVIDIA) or Vulkan (AMD/Intel) via Cargo features.
 - **Linux**: ALSA/PulseAudio. Build deps: `cmake`, `llvm`, `libomp`. CUDA/Vulkan via Cargo features.
 
