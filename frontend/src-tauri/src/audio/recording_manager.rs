@@ -103,15 +103,28 @@ impl RecordingManager {
             system_device.as_ref().map(|d| d.name.clone())
         );
 
-        // Start the audio processing pipeline with FFmpeg adaptive mixer
-        // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
-        // 3) Apply VAD and send speech segments to transcription
+        // Start the audio processing pipeline. Per Tauri-Unmix #57: the
+        // pipeline now runs two parallel per-source VAD chains for
+        // transcription. The mixer (recording_sender_for_mixed) is opt-in
+        // and only allocated when audio checkpointing is enabled —
+        // otherwise the pipeline does not pay the chunk-clone cost on the
+        // hot path. We therefore only pass `Some(recording_sender)` when
+        // `auto_save` is true; when false, the saver task would discard
+        // chunks anyway.
+        let recording_sender_for_pipeline = if auto_save {
+            Some(recording_sender)
+        } else {
+            // Drop the sender to release the saver task's recv loop
+            // cleanly when the recording stops.
+            drop(recording_sender);
+            None
+        };
         self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
-            Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            recording_sender_for_pipeline,
             mic_name,
             mic_kind,
             sys_name,

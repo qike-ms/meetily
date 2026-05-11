@@ -16,12 +16,19 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  // NEW (Tauri-Unmix): per-source label. 'mic' = local microphone (YOU),
+  // 'system' = system audio (THEM). May be null for legacy transcripts
+  // recorded before the unmix migration — render those with neutral styling.
+  source?: 'mic' | 'system' | null;
 }
 
 export interface TranscriptUpdate {
   text: string;
   timestamp: string; // Wall-clock time for reference
-  source: string;
+  // NEW (Tauri-Unmix): tightened from `string` to a discriminated union.
+  // Backward-compat: 'Audio' is the legacy value emitted by pre-unmix
+  // builds when the transcription path was a single mixed stream.
+  source: 'mic' | 'system' | 'Audio';
   sequence_id: number;
   chunk_start_time: number; // Legacy field
   is_partial: boolean;
@@ -107,4 +114,6 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  // NEW (Tauri-Unmix): per-source label, mirrors `Transcript.source`.
+  source?: 'mic' | 'system' | null;
 }
