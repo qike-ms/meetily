@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
-use super::vad::{VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE};
+use crate::vad::{VAD_FRAME_SAMPLES, VAD_SAMPLE_RATE};
 
 /// Number of input samples (per channel) we feed to rubato per call.
 /// 1440 input samples @ 48 kHz = 30 ms = 480 output samples @ 16 kHz.
@@ -27,6 +27,8 @@ pub struct Resampler16k {
 }
 
 impl Resampler16k {
+    /// Construct a 16 kHz resampler for cpal input at `input_rate` Hz with
+    /// `input_channels` interleaved channels (downmixed to mono).
     pub fn new(input_rate: u32, input_channels: u16) -> Result<Self> {
         anyhow::ensure!(input_channels >= 1, "input_channels must be >= 1");
         let params = SincInterpolationParameters {
@@ -86,6 +88,7 @@ impl Resampler16k {
         Ok(frames)
     }
 
+    /// Input sample rate this resampler was constructed for.
     pub fn input_rate(&self) -> u32 {
         self.input_rate
     }

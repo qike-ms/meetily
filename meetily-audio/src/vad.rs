@@ -54,6 +54,7 @@ pub struct Utterance {
 }
 
 impl Utterance {
+    /// Utterance duration in milliseconds (`end_ms - start_ms`, saturating).
     pub fn duration_ms(&self) -> u64 {
         self.end_ms.saturating_sub(self.start_ms)
     }
