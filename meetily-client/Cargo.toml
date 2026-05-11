@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+meetily-audio = { path = "../meetily-audio" }
 tokio = { version = "1", features = ["full"] }
 cpal = "0.15"
 whisper-rs = { version = "0.13", features = ["raw-api"] }
