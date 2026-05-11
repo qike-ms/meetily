@@ -216,10 +216,30 @@ async fn run_streaming_session(
     let stop = CancellationToken::new();
     let stop_for_signal = stop.clone();
 
-    // Watch for Ctrl+C and flag stop. Don't drain yet -- pump still has utterances.
+    // Watch for Ctrl+C. First SIGINT signals stop (drain begins). A second
+    // SIGINT at any point hard-exits the process — `tokio::task::spawn_blocking`
+    // tasks (Whisper transcribes) cannot be aborted once started, so we
+    // cannot cleanly join them; the only honest "abort" is `process::exit`.
+    // The user trades any pending transcripts (and the final upload) for an
+    // immediate prompt return.
     tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
+        // First Ctrl+C → stop signal.
+        if tokio::signal::ctrl_c().await.is_ok() {
             stop_for_signal.cancel();
+        }
+        // Second Ctrl+C → hard exit. We listen forever; if user never
+        // presses again, this task exits with the runtime.
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!(
+                "\n>>> Second Ctrl+C received: hard-exiting. \
+                 Any pending Whisper transcribes are abandoned; \
+                 the final transcript was NOT uploaded. <<<"
+            );
+            // Best-effort flush so the warning is visible before we go.
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let _ = std::io::stdout().flush();
+            std::process::exit(130); // 128 + SIGINT
         }
     });
 
@@ -260,12 +280,51 @@ async fn run_streaming_session(
         .await_completion()
         .context("failed to await pump completion")?;
 
-    println!("\n>>> Awaiting {} pending transcriptions... <<<", transcribe_tasks.len());
-    for task in transcribe_tasks {
-        match task.await {
-            Ok(Ok(mut segs)) => all_segments.append(&mut segs),
-            Ok(Err(err)) => log::warn!("transcribe task failed: {err:#}"),
-            Err(err) => log::warn!("transcribe join failed: {err:#}"),
+    // Drain pending transcriptions with a live progress counter. A second
+    // Ctrl+C fires the global handler installed at session start, which
+    // hard-exits via process::exit(130) — `tokio::task::spawn_blocking` work
+    // (Whisper transcribes) cannot be aborted once started, so the only
+    // honest "abort" path is process exit. The user is told this in the
+    // banner below.
+    let total = transcribe_tasks.len();
+    if total > 0 {
+        println!(
+            "\n>>> Transcribing {total} pending utterances... (Ctrl+C again to hard-exit, abandoning pending transcripts) <<<"
+        );
+
+        let mut joinset = tokio::task::JoinSet::new();
+        for task in transcribe_tasks {
+            // Move the JoinHandle into the JoinSet by spawning a thin wrapper
+            // that awaits it. This adds one task layer but keeps the existing
+            // spawn_transcribe contract unchanged.
+            joinset.spawn(async move { task.await });
+        }
+
+        let mut completed = 0usize;
+        while let Some(next) = joinset.join_next().await {
+            match next {
+                Ok(Ok(Ok(mut segs))) => {
+                    all_segments.append(&mut segs);
+                    completed += 1;
+                    println!(
+                        ">>> Transcribed {completed}/{total} ({} pending) <<<",
+                        joinset.len()
+                    );
+                }
+                Ok(Ok(Err(err))) => {
+                    log::warn!("transcribe task failed: {err:#}");
+                    completed += 1;
+                }
+                Ok(Err(err)) => {
+                    log::warn!("transcribe join failed: {err:#}");
+                    completed += 1;
+                }
+                Err(err) => {
+                    // JoinSet's outer task panicked or was cancelled.
+                    log::warn!("transcribe wrapper task failed: {err:#}");
+                    completed += 1;
+                }
+            }
         }
     }
 
