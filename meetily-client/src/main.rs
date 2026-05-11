@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use meetily_client::audio::capture::{
-    record_dual_stream, record_streaming, StreamSource, StreamingChunk,
+    record_dual_stream, record_streaming, StreamSource, StreamingChunk, SystemBackend,
 };
 use meetily_client::audio::devices::list_devices;
 use meetily_client::transcribe::{
@@ -16,6 +16,21 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use whisper_rs::WhisperContext;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BackendArg {
+    Cpal,
+    Coreaudio,
+}
+
+impl BackendArg {
+    fn into_system_backend(self) -> SystemBackend {
+        match self {
+            BackendArg::Cpal => SystemBackend::Cpal,
+            BackendArg::Coreaudio => SystemBackend::CoreAudio,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "meetily-client")]
@@ -47,6 +62,15 @@ enum Commands {
         /// Set to false for the legacy batch path that records full WAVs first.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         streaming: bool,
+
+        /// System-audio capture backend. `cpal` (default) uses the cross-platform
+        /// cpal default-output loopback (requires BlackHole / Multi-Output Device
+        /// on macOS, and uses the device named by `--system`). `coreaudio` uses
+        /// Apple's native Core Audio Tap on macOS 14.2+ — no third-party drivers
+        /// required and `--system` is ignored (taps the default output mix).
+        /// Currently only honored in streaming mode (`--streaming true`).
+        #[arg(long, value_enum, default_value_t = BackendArg::Cpal)]
+        backend: BackendArg,
     },
     Devices,
     DownloadModel {
@@ -68,7 +92,16 @@ async fn main() -> Result<()> {
             system,
             model,
             streaming,
+            backend,
         } => {
+            // Validate flag combos before doing any I/O.
+            if !streaming && matches!(backend, BackendArg::Coreaudio) {
+                anyhow::bail!(
+                    "--backend coreaudio is only supported in streaming mode. \
+                     Either drop --streaming false or omit --backend."
+                );
+            }
+
             println!("\n=== Meetily Client ===");
             println!("Available audio devices:");
             for device in list_devices() {
@@ -94,7 +127,7 @@ async fn main() -> Result<()> {
             println!("Model loaded.");
 
             let segments = if streaming {
-                run_streaming_session(mic, system, whisper.clone()).await?
+                run_streaming_session(mic, system, backend.into_system_backend(), whisper.clone()).await?
             } else {
                 run_batch_session(mic, system, &whisper).await?
             };
@@ -135,11 +168,12 @@ async fn main() -> Result<()> {
 async fn run_streaming_session(
     mic: Option<String>,
     system: Option<String>,
+    system_backend: SystemBackend,
     whisper: Arc<WhisperContext>,
 ) -> Result<Vec<TranscriptSegment>> {
     println!("\n>>> Recording started (streaming VAD). Press Ctrl+C to stop. <<<\n");
 
-    let (mut handle, mut rx) = record_streaming(mic, system).context("failed to start streaming capture")?;
+    let (mut handle, mut rx) = record_streaming(mic, system, system_backend).context("failed to start streaming capture")?;
     let recording_started = Instant::now();
     let stop = CancellationToken::new();
     let stop_for_signal = stop.clone();
