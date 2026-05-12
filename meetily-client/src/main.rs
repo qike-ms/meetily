@@ -209,7 +209,31 @@ async fn run_streaming_session(
     enable_aec: bool,
     whisper: Arc<WhisperContext>,
 ) -> Result<Vec<TranscriptSegment>> {
-    println!("\n>>> Recording started (streaming VAD). Press Ctrl+C to stop. <<<\n");
+    let backend_label = match system_backend {
+        SystemBackend::Cpal => "cpal",
+        SystemBackend::CoreAudio => "coreaudio (Apple Core Audio Tap)",
+        _ => "unknown",
+    };
+    let system_active = match (system.as_deref(), system_backend) {
+        (None, SystemBackend::Cpal) => false,
+        _ => true,
+    };
+    // Bind the source-name string up front so the println! borrow doesn't
+    // conflict with the move into record_streaming below.
+    let system_label = if system_active {
+        system.as_deref().unwrap_or("default-output-mix").to_string()
+    } else {
+        "DISABLED (no system audio)".to_string()
+    };
+    let mic_label = mic.as_deref().unwrap_or("default").to_string();
+    println!(
+        "\n>>> Recording started — mic={} system={} backend={} aec={} <<<",
+        mic_label,
+        system_label,
+        backend_label,
+        if enable_aec { "on" } else { "off" }
+    );
+    println!(">>> Press Ctrl+C to stop. <<<\n");
 
     let (mut handle, mut rx) = record_streaming(mic, system, system_backend, enable_aec).context("failed to start streaming capture")?;
     let recording_started = Instant::now();
@@ -245,6 +269,16 @@ async fn run_streaming_session(
 
     let mut all_segments: Vec<TranscriptSegment> = Vec::new();
     let mut transcribe_tasks: Vec<tokio::task::JoinHandle<Result<Vec<TranscriptSegment>>>> = Vec::new();
+    let mut mic_count = 0usize;
+    let mut sys_count = 0usize;
+    let mut system_silence_warned = false;
+    // Warn after 15s of recording if system audio is supposedly active but
+    // produced zero utterances. Most common cause on macOS: Core Audio
+    // Tap permission denied (NSAudioCaptureUsageDescription dialog
+    // dismissed) → tap returns silence. The mic still picks up speaker
+    // echo and gets tagged [YOU], which looks like "system audio is
+    // mislabeled as mic" but is actually "system stream is empty".
+    let system_should_be_active = system_active;
 
     loop {
         tokio::select! {
@@ -252,9 +286,30 @@ async fn run_streaming_session(
                 println!("\n>>> Stop signal received, draining remaining utterances... <<<");
                 break;
             }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                if !system_silence_warned
+                    && system_should_be_active
+                    && sys_count == 0
+                    && recording_started.elapsed() >= std::time::Duration::from_secs(15)
+                {
+                    eprintln!(
+                        "\n>>> WARN: 15s elapsed, system audio captured 0 utterances. \
+                         If you're playing audio through speakers, this is most likely \
+                         a Core Audio Tap permission issue (macOS 14.2+ NSAudioCaptureUsageDescription). \
+                         Mic transcripts may show speaker echo tagged [YOU]. \
+                         Workaround: pass --backend cpal --system \"<output device name>\" \
+                         (run `meetily-client devices` for names). <<<\n"
+                    );
+                    system_silence_warned = true;
+                }
+            }
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
                     Some(chunk) => {
+                        match chunk.source {
+                            StreamSource::Mic => mic_count += 1,
+                            StreamSource::System => sys_count += 1,
+                        }
                         let task = spawn_transcribe(whisper.clone(), chunk, recording_started);
                         transcribe_tasks.push(task);
                     }
@@ -306,10 +361,14 @@ async fn run_streaming_session(
                 Ok(Ok(Ok(mut segs))) => {
                     all_segments.append(&mut segs);
                     completed += 1;
-                    println!(
-                        ">>> Transcribed {completed}/{total} ({} pending) <<<",
-                        joinset.len()
-                    );
+                    // Only print every 5 completions or the last one to
+                    // keep the drain readable when N is large.
+                    if completed % 5 == 0 || joinset.is_empty() {
+                        println!(
+                            ">>> drained {completed}/{total} ({} pending) <<<",
+                            joinset.len()
+                        );
+                    }
                 }
                 Ok(Ok(Err(err))) => {
                     log::warn!("transcribe task failed: {err:#}");
@@ -354,27 +413,21 @@ fn spawn_transcribe(
 ) -> tokio::task::JoinHandle<Result<Vec<TranscriptSegment>>> {
     let StreamingChunk { source, utterance } = chunk;
     let source_tag = source.as_str().to_string();
-    // Print live header immediately so the user sees activity even before
-    // whisper finishes; the actual text follows when transcription returns.
-    let elapsed = recording_started.elapsed().as_secs();
-    let mins = elapsed / 60;
-    let secs = elapsed % 60;
     let label = match source {
         StreamSource::Mic => "YOU",
         StreamSource::System => "THEM",
     };
-    println!(
-        "  [{:02}:{:02}] [{}] ... ({} ms speech)",
-        mins, secs, label, utterance.duration_ms()
-    );
+    let _ = recording_started;
 
     // Use utterance start_ms (relative to VAD session start) as the wall-clock
     // offset so timestamps stay monotonic per source.
     let offset_seconds = utterance.start_ms as f64 / 1000.0;
     tokio::task::spawn_blocking(move || {
         let segments = transcribe_chunk(&utterance.samples, &whisper, &source_tag, offset_seconds)?;
+        // Print one line per actual transcript text — no placeholder
+        // header (kept the terminal too noisy when speech was frequent).
         for seg in &segments {
-            println!("  [{}] [{}] {}", seg.timestamp, label, seg.text);
+            println!("[{}] [{}] {}", seg.timestamp, label, seg.text);
         }
         Ok(segments)
     })
