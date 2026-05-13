@@ -406,7 +406,29 @@ async fn run_streaming_session(
     // → keep [THEM], drop [YOU]. Tuned against `say` echo on a MacBook Pro
     // built-in mic; intentionally lenient because Whisper transcribes
     // mic-echo and system-tap with slightly different errors.
+    // Pass 1: drop Whisper hallucinations on the mic side. When the mic
+    // is mostly silent or carrying faint speaker echo, Whisper invents
+    // stereotyped short phrases ("Yeah.", "Thank you.", "Subscribe to my
+    // channel.", etc.). Filter them BEFORE dedup so they can't survive
+    // simply because their tokens don't appear in the system stream.
     let original_n = all_segments.len();
+    let halluc_indices = compute_whisper_hallucinations(&all_segments);
+    if !halluc_indices.is_empty() {
+        let halluc_set: std::collections::HashSet<usize> =
+            halluc_indices.iter().copied().collect();
+        all_segments = all_segments
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| if halluc_set.contains(&i) { None } else { Some(s) })
+            .collect();
+        println!(
+            ">>> dropped {} suspected Whisper hallucination(s) on the mic stream",
+            halluc_set.len()
+        );
+    }
+
+    // Pass 2: drop mic segments that are echoes of system segments.
+    let after_halluc_n = all_segments.len();
     let drop_indices = compute_mic_echo_dups(&all_segments);
     if !drop_indices.is_empty() {
         let drop_set: std::collections::HashSet<usize> = drop_indices.iter().copied().collect();
@@ -417,9 +439,10 @@ async fn run_streaming_session(
             .collect();
         println!(
             ">>> deduped {} mic echo segment(s) of system audio (kept system as canonical)",
-            original_n - all_segments.len()
+            after_halluc_n - all_segments.len()
         );
     }
+    let _ = original_n;
 
     if !all_segments.is_empty() {
         println!("\n=== Final Transcript ({} segments) ===", all_segments.len());
@@ -444,6 +467,85 @@ async fn run_streaming_session(
 /// fragments. A mic segment is a duplicate if its time interval overlaps
 /// (or is within `WINDOW_PAD_SECS`) of a system segment AND ≥75% of the
 /// mic's tokens appear in that system segment.
+/// Detect Whisper hallucinations on the mic stream.
+///
+/// When the mic input is mostly silence, room noise, or faint speaker
+/// echo, Whisper invents short stereotyped phrases ("Yeah.", "Thank
+/// you.", "Subscribe to my channel.", etc.) — these are well-known in
+/// the openai/whisper community as quiet-input artifacts. We drop them
+/// from the mic stream only (system-stream tap audio is digitally clean
+/// and doesn't trigger this).
+///
+/// Heuristic: a mic segment is a hallucination if its normalized text
+/// matches the stock-phrase list AND it's short enough to be plausibly
+/// invented (≤ MAX_HALLUC_TOKENS).
+fn compute_whisper_hallucinations(segments: &[TranscriptSegment]) -> Vec<usize> {
+    const MAX_HALLUC_TOKENS: usize = 6;
+
+    // Normalised stock phrases. Lowercase, alphanumeric tokens joined by
+    // single space — match against `normalize(seg.text)`.
+    const STOCK_PHRASES: &[&str] = &[
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "thank you so much",
+        "thank you very much",
+        "yeah",
+        "yes",
+        "ok",
+        "okay",
+        "mm hmm",
+        "uh huh",
+        "bye",
+        "goodbye",
+        "see you",
+        "see you later",
+        "see you next time",
+        "subscribe",
+        "subscribe to my channel",
+        "please subscribe",
+        "like and subscribe",
+        "test test",
+        "test",
+        "hello",
+        "hi",
+        "hi everyone",
+        "hello everyone",
+    ];
+
+    fn normalize(s: &str) -> String {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn token_count(norm: &str) -> usize {
+        if norm.is_empty() {
+            0
+        } else {
+            norm.split(' ').count()
+        }
+    }
+
+    let stock: std::collections::HashSet<&str> = STOCK_PHRASES.iter().copied().collect();
+    let mut drop = Vec::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if seg.source != "mic" {
+            continue;
+        }
+        let norm = normalize(&seg.text);
+        if token_count(&norm) > MAX_HALLUC_TOKENS {
+            continue;
+        }
+        if stock.contains(norm.as_str()) {
+            drop.push(i);
+        }
+    }
+    drop
+}
+
 fn compute_mic_echo_dups(segments: &[TranscriptSegment]) -> Vec<usize> {
     const WINDOW_PAD_SECS: f64 = 1.0;
     const CONTAINMENT_MIN: f64 = 0.6;
