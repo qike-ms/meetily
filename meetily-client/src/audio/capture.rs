@@ -253,8 +253,14 @@ pub fn record_streaming(
         // RenderDelayController re-estimates on the next aligned audio.
         let (render_tx, render_rx) = sync_channel::<Vec<f32>>(64);
         let render_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let aec = meetily_audio::aec::AecPipeline::new(16_000)
+        let mut aec = meetily_audio::aec::AecPipeline::new(16_000)
             .context("failed to initialize AecPipeline")?;
+        // Seed the delay estimator with a typical macOS built-in
+        // speaker→mic round-trip (~100 ms). sonora-aec3's
+        // RenderDelayController will refine continuously, but without a
+        // hint it reports delay_ms=0 indefinitely on this hardware
+        // (verified via DIAG self-test 2026-05-12).
+        aec.set_delay_hint_ms(100);
         (
             AecRole::Mic { aec, render_rx, render_drops: render_drops.clone() },
             AecRole::System { render_tx, render_drops },

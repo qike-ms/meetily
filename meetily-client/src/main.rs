@@ -287,18 +287,23 @@ async fn run_streaming_session(
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                // Only warn when mic IS producing utterances but system
+                // is silent — that's the diagnostic case (Core Audio Tap
+                // permission denied, etc.). If neither side has produced
+                // anything, the user just hasn't started playing audio yet.
                 if !system_silence_warned
                     && system_should_be_active
                     && sys_count == 0
-                    && recording_started.elapsed() >= std::time::Duration::from_secs(15)
+                    && mic_count >= 3
+                    && recording_started.elapsed() >= std::time::Duration::from_secs(20)
                 {
                     eprintln!(
-                        "\n>>> WARN: 15s elapsed, system audio captured 0 utterances. \
-                         If you're playing audio through speakers, this is most likely \
-                         a Core Audio Tap permission issue (macOS 14.2+ NSAudioCaptureUsageDescription). \
+                        "\n>>> WARN: mic captured {mic_count} utterances but system audio captured 0 in {}s. \
+                         If you're playing audio through speakers, this is likely a \
+                         Core Audio Tap permission issue (macOS 14.2+ NSAudioCaptureUsageDescription). \
                          Mic transcripts may show speaker echo tagged [YOU]. \
-                         Workaround: pass --backend cpal --system \"<output device name>\" \
-                         (run `meetily-client devices` for names). <<<\n"
+                         Workaround: pass --backend cpal --system \"<output device name>\". <<<\n",
+                        recording_started.elapsed().as_secs()
                     );
                     system_silence_warned = true;
                 }
@@ -394,6 +399,28 @@ async fn run_streaming_session(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Dedup pass: drop mic segments that are duplicates of system segments.
+    // Captures the common case where system audio plays through speakers
+    // and the mic picks up the echo, producing a [YOU] copy of a [THEM]
+    // segment. Heuristic: ±1.5s start window, ≥0.7 Jaccard token overlap
+    // → keep [THEM], drop [YOU]. Tuned against `say` echo on a MacBook Pro
+    // built-in mic; intentionally lenient because Whisper transcribes
+    // mic-echo and system-tap with slightly different errors.
+    let original_n = all_segments.len();
+    let drop_indices = compute_mic_echo_dups(&all_segments);
+    if !drop_indices.is_empty() {
+        let drop_set: std::collections::HashSet<usize> = drop_indices.iter().copied().collect();
+        all_segments = all_segments
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| if drop_set.contains(&i) { None } else { Some(s) })
+            .collect();
+        println!(
+            ">>> deduped {} mic echo segment(s) of system audio (kept system as canonical)",
+            original_n - all_segments.len()
+        );
+    }
+
     if !all_segments.is_empty() {
         println!("\n=== Final Transcript ({} segments) ===", all_segments.len());
         for seg in &all_segments {
@@ -404,6 +431,64 @@ async fn run_streaming_session(
     }
 
     Ok(all_segments)
+}
+
+/// Compute indices of mic segments that look like echoes of system
+/// segments. Segments must already be sorted by audio_start_time.
+/// Returns indices into the input slice that should be dropped (always
+/// mic-side; system stays as canonical).
+fn compute_mic_echo_dups(segments: &[TranscriptSegment]) -> Vec<usize> {
+    const WINDOW_SECS: f64 = 1.5;
+    const JACCARD_MIN: f64 = 0.5;
+
+    fn tok(s: &str) -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 2)
+            .map(|w| w.to_string())
+            .collect()
+    }
+    fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
+        if a.is_empty() && b.is_empty() {
+            return 1.0;
+        }
+        let inter = a.intersection(b).count();
+        let union = a.union(b).count();
+        if union == 0 {
+            0.0
+        } else {
+            inter as f64 / union as f64
+        }
+    }
+
+    // Pre-tokenise so the inner loop is cheap.
+    let toks: Vec<std::collections::HashSet<String>> =
+        segments.iter().map(|s| tok(&s.text)).collect();
+    let starts: Vec<f64> = segments
+        .iter()
+        .map(|s| s.audio_start_time.unwrap_or(0.0))
+        .collect();
+
+    let mut drop = Vec::new();
+    for (i, mic) in segments.iter().enumerate() {
+        if mic.source != "mic" {
+            continue;
+        }
+        // Look at neighbours within ±WINDOW_SECS.
+        for (j, sys) in segments.iter().enumerate() {
+            if j == i || sys.source != "system" {
+                continue;
+            }
+            if (starts[j] - starts[i]).abs() > WINDOW_SECS {
+                continue;
+            }
+            if jaccard(&toks[i], &toks[j]) >= JACCARD_MIN {
+                drop.push(i);
+                break;
+            }
+        }
+    }
+    drop
 }
 
 fn spawn_transcribe(

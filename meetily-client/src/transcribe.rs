@@ -24,7 +24,30 @@ pub struct TranscriptSegment {
     pub duration: Option<f64>,
 }
 
+use std::sync::Once;
+
+/// Install a no-op log callback into whisper.cpp / ggml so the C-side
+/// stderr spam (`whisper_init_state: kv self size = ...`,
+/// `ggml_metal_init: picking default device: ...`, etc.) doesn't flood the
+/// terminal. We call this lazily once before the first transcribe.
+fn silence_whisper_native_logs() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        unsafe extern "C" fn noop_log(
+            _level: u32,
+            _text: *const std::os::raw::c_char,
+            _user_data: *mut std::os::raw::c_void,
+        ) {
+            // discard everything
+        }
+        unsafe {
+            whisper_rs::set_log_callback(Some(noop_log), std::ptr::null_mut());
+        }
+    });
+}
+
 pub fn load_model(model_path: impl AsRef<Path>) -> Result<WhisperContext> {
+    silence_whisper_native_logs();
     let model = model_path.as_ref().to_string_lossy();
     WhisperContext::new_with_params(&model, WhisperContextParameters::default()).map_err(|err| {
         anyhow!(
