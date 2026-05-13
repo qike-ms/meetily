@@ -442,6 +442,36 @@ async fn run_streaming_session(
             after_halluc_n - all_segments.len()
         );
     }
+
+    // Pass 3 (the workhorse): time-interval overlap. If a mic utterance's
+    // time window is ≥40% covered by overlapping system utterances, treat
+    // it as acoustic echo and drop. This is the v1 fix recommended by both
+    // codex and Claude Code second-opinions; their core point: Whisper
+    // transcribes mic-echo with different word errors than the digital
+    // system tap, so token-similarity dedup misses cases that pure time
+    // overlap catches. Trade-off: loses genuine simultaneous user speech
+    // — acceptable for a meeting-recording tool where the user is mostly
+    // listening, and a much better failure mode than leaking duplicate
+    // transcripts.
+    //
+    // The permanent fix is to use AUVoiceProcessingIO for the mic capture
+    // (Apple hardware AEC, 20-40 dB suppression — what Granola/Zoom/Teams/
+    // FaceTime use); this overlap dedup goes away once that lands.
+    let after_token_n = all_segments.len();
+    let overlap_indices = compute_mic_time_overlap_with_system(&all_segments);
+    if !overlap_indices.is_empty() {
+        let drop_set: std::collections::HashSet<usize> =
+            overlap_indices.iter().copied().collect();
+        all_segments = all_segments
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| if drop_set.contains(&i) { None } else { Some(s) })
+            .collect();
+        println!(
+            ">>> suppressed {} mic segment(s) that time-overlapped system audio (likely acoustic echo)",
+            after_token_n - all_segments.len()
+        );
+    }
     let _ = original_n;
 
     if !all_segments.is_empty() {
@@ -540,6 +570,69 @@ fn compute_whisper_hallucinations(segments: &[TranscriptSegment]) -> Vec<usize> 
             continue;
         }
         if stock.contains(norm.as_str()) {
+            drop.push(i);
+        }
+    }
+    drop
+}
+
+/// Drop mic segments whose time interval is heavily covered by overlapping
+/// system segments. Pure timestamp-based heuristic — does NOT look at
+/// transcript content. Robust to Whisper transcribing mic-echo with
+/// different word errors than the system tap.
+///
+/// Semantics: for each mic segment, sum the length of its overlap with
+/// each system segment. If `overlap / mic_duration >= MIN_OVERLAP_RATIO`,
+/// drop the mic segment.
+///
+/// Tradeoff: loses simultaneous user speech. Acceptable for v1; the real
+/// fix is AUVoiceProcessingIO on the mic capture (see
+/// `compute_mic_echo_dups` doc comment for the full plan).
+fn compute_mic_time_overlap_with_system(segments: &[TranscriptSegment]) -> Vec<usize> {
+    const MIN_OVERLAP_RATIO: f64 = 0.40;
+    const MIN_MIC_DURATION: f64 = 0.10; // ignore tiny mic blips (< 100 ms)
+
+    let starts: Vec<f64> = segments
+        .iter()
+        .map(|s| s.audio_start_time.unwrap_or(0.0))
+        .collect();
+    let ends: Vec<f64> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.audio_end_time
+                .or_else(|| s.duration.map(|d| starts[i] + d))
+                .unwrap_or(starts[i] + 1.0)
+        })
+        .collect();
+
+    let mut drop = Vec::new();
+    for (i, mic) in segments.iter().enumerate() {
+        if mic.source != "mic" {
+            continue;
+        }
+        let mic_s = starts[i];
+        let mic_e = ends[i];
+        let mic_dur = (mic_e - mic_s).max(0.0);
+        if mic_dur < MIN_MIC_DURATION {
+            continue;
+        }
+        // Sum overlap with all system segments.
+        let mut total_overlap = 0.0;
+        for (j, sys) in segments.iter().enumerate() {
+            if j == i || sys.source != "system" {
+                continue;
+            }
+            let sys_s = starts[j];
+            let sys_e = ends[j];
+            let lo = mic_s.max(sys_s);
+            let hi = mic_e.min(sys_e);
+            if hi > lo {
+                total_overlap += hi - lo;
+            }
+        }
+        let ratio = total_overlap / mic_dur;
+        if ratio >= MIN_OVERLAP_RATIO {
             drop.push(i);
         }
     }
@@ -808,5 +901,62 @@ mod tests {
         ];
         let drops = compute_mic_echo_dups(&segs);
         assert!(drops.is_empty(), "mic far from system in time must not be dropped, got {:?}", drops);
+    }
+
+    #[test]
+    fn time_overlap_drops_mic_under_system() {
+        // Classic acoustic-echo case: mic fully under system, transcripts
+        // diverge enough that token dedup misses it. Pure timestamp catches.
+        let segs = vec![
+            seg("system", 5.0, 8.0, "alpha bravo charlie delta echo"),
+            seg("mic", 5.2, 7.8, "totally different words that whisper invented"),
+        ];
+        let drops = compute_mic_time_overlap_with_system(&segs);
+        assert_eq!(drops, vec![1], "mic fully under system must be dropped by time-overlap");
+    }
+
+    #[test]
+    fn time_overlap_keeps_mic_outside_system() {
+        let segs = vec![
+            seg("system", 1.0, 3.0, "system content"),
+            seg("mic", 10.0, 12.0, "user speech while system silent"),
+        ];
+        let drops = compute_mic_time_overlap_with_system(&segs);
+        assert!(drops.is_empty(), "mic outside system intervals must be kept");
+    }
+
+    #[test]
+    fn time_overlap_keeps_mic_with_only_partial_overlap() {
+        // Mic 4s long, only 1s overlaps system → 25% overlap, below 40% bar.
+        let segs = vec![
+            seg("system", 5.0, 6.0, "brief system"),
+            seg("mic", 5.0, 9.0, "long user speech that ran into a brief system burst"),
+        ];
+        let drops = compute_mic_time_overlap_with_system(&segs);
+        assert!(drops.is_empty(), "mic with <40% overlap must be kept, got {:?}", drops);
+    }
+
+    #[test]
+    fn time_overlap_aggregates_multiple_system_segments() {
+        // Mic 5s covered by two adjacent system segments (no single one
+        // covers ≥40% alone but their union does).
+        let segs = vec![
+            seg("system", 5.0, 6.5, "first half"),
+            seg("system", 6.5, 8.0, "second half"),
+            seg("mic", 5.0, 7.5, "echo of both system fragments"),
+        ];
+        let drops = compute_mic_time_overlap_with_system(&segs);
+        assert_eq!(drops, vec![2], "mic covered by union of two system segs must be dropped");
+    }
+
+    #[test]
+    fn time_overlap_ignores_tiny_mic_blips() {
+        // 50ms blip should be ignored (below MIN_MIC_DURATION).
+        let segs = vec![
+            seg("system", 1.0, 5.0, "system audio"),
+            seg("mic", 2.0, 2.05, ""),
+        ];
+        let drops = compute_mic_time_overlap_with_system(&segs);
+        assert!(drops.is_empty(), "sub-100ms mic blip must be ignored, got {:?}", drops);
     }
 }
