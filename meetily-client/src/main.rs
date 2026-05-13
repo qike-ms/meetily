@@ -437,9 +437,19 @@ async fn run_streaming_session(
 /// segments. Segments must already be sorted by audio_start_time.
 /// Returns indices into the input slice that should be dropped (always
 /// mic-side; system stays as canonical).
+///
+/// Uses **token containment** with **interval overlap** so we catch the
+/// common case where mic and system VADs chunk speech at different
+/// boundaries — e.g. one long system utterance covers several short mic
+/// fragments. A mic segment is a duplicate if its time interval overlaps
+/// (or is within `WINDOW_PAD_SECS`) of a system segment AND ≥75% of the
+/// mic's tokens appear in that system segment.
 fn compute_mic_echo_dups(segments: &[TranscriptSegment]) -> Vec<usize> {
-    const WINDOW_SECS: f64 = 1.5;
-    const JACCARD_MIN: f64 = 0.5;
+    const WINDOW_PAD_SECS: f64 = 1.0;
+    const CONTAINMENT_MIN: f64 = 0.6;
+    const SHORT_UTT_TOKENS: usize = 5;
+    const SHORT_UTT_CONTAINMENT_MIN: f64 = 0.5;
+    const MIN_TOKENS: usize = 2;
 
     fn tok(s: &str) -> std::collections::HashSet<String> {
         s.to_lowercase()
@@ -448,43 +458,71 @@ fn compute_mic_echo_dups(segments: &[TranscriptSegment]) -> Vec<usize> {
             .map(|w| w.to_string())
             .collect()
     }
-    fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
+    fn containment(
+        needle: &std::collections::HashSet<String>,
+        haystack: &std::collections::HashSet<String>,
+    ) -> f64 {
+        if needle.is_empty() {
+            return 0.0;
         }
-        let inter = a.intersection(b).count();
-        let union = a.union(b).count();
-        if union == 0 {
-            0.0
-        } else {
-            inter as f64 / union as f64
-        }
+        let inter = needle.intersection(haystack).count();
+        inter as f64 / needle.len() as f64
     }
 
-    // Pre-tokenise so the inner loop is cheap.
     let toks: Vec<std::collections::HashSet<String>> =
         segments.iter().map(|s| tok(&s.text)).collect();
     let starts: Vec<f64> = segments
         .iter()
         .map(|s| s.audio_start_time.unwrap_or(0.0))
         .collect();
+    let ends: Vec<f64> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.audio_end_time
+                .or_else(|| s.duration.map(|d| starts[i] + d))
+                .unwrap_or(starts[i] + 1.0)
+        })
+        .collect();
 
     let mut drop = Vec::new();
     for (i, mic) in segments.iter().enumerate() {
-        if mic.source != "mic" {
+        if mic.source != "mic" || toks[i].len() < MIN_TOKENS {
             continue;
         }
-        // Look at neighbours within ±WINDOW_SECS.
+        let mic_s = starts[i] - WINDOW_PAD_SECS;
+        let mic_e = ends[i] + WINDOW_PAD_SECS;
+
+        // Aggregate the token set of ALL system segments overlapping the
+        // mic interval. Handles two cases that single-pair check misses:
+        //   - one long system segment spanning many short mic fragments
+        //     (each mic ⊆ system union)
+        //   - one long mic segment spanning many short system fragments
+        //     (mic ⊆ union of those systems)
+        let mut sys_union: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (j, sys) in segments.iter().enumerate() {
             if j == i || sys.source != "system" {
                 continue;
             }
-            if (starts[j] - starts[i]).abs() > WINDOW_SECS {
-                continue;
+            let sys_s = starts[j];
+            let sys_e = ends[j];
+            // Interval overlap with slack
+            if mic_s < sys_e && sys_s < mic_e {
+                sys_union.extend(toks[j].iter().cloned());
             }
-            if jaccard(&toks[i], &toks[j]) >= JACCARD_MIN {
+        }
+
+        if !sys_union.is_empty() {
+            let c = containment(&toks[i], &sys_union);
+            // Lower bar for short utterances — they're more likely to be
+            // mic-echo fragments where Whisper missed a word or two.
+            let threshold = if toks[i].len() <= SHORT_UTT_TOKENS {
+                SHORT_UTT_CONTAINMENT_MIN
+            } else {
+                CONTAINMENT_MIN
+            };
+            if c >= threshold {
                 drop.push(i);
-                break;
             }
         }
     }
@@ -584,5 +622,89 @@ async fn delete_temp_wav(path: &std::path::Path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => log::warn!("failed to delete temp WAV {}: {err}", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(source: &str, start: f64, end: f64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            id: format!("t-{}", start),
+            timestamp: format!("00:00:{:.3}", start),
+            text: text.to_string(),
+            source: source.to_string(),
+            confidence: 1.0,
+            duration_ms: ((end - start) * 1000.0) as u32,
+            audio_start_time: Some(start),
+            audio_end_time: Some(end),
+            duration: Some(end - start),
+        }
+    }
+
+    #[test]
+    fn dedup_drops_mic_echo_of_system() {
+        let segs = vec![
+            seg("system", 1.0, 4.0, "first test sentence apple banana cherry"),
+            seg("mic", 1.5, 4.5, "first test sentence apple banana cherry"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert_eq!(drops, vec![1], "mic echo should be dropped");
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_user_speech_during_system() {
+        let segs = vec![
+            seg("system", 1.0, 5.0, "the system talks about apples bananas and cherries"),
+            seg("mic", 2.0, 4.0, "i am the user discussing quantum mechanics relativity"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert!(drops.is_empty(), "distinct user speech must not be dropped, got {:?}", drops);
+    }
+
+    #[test]
+    fn dedup_handles_fragmented_system_segments() {
+        // Long mic utterance covering several short system fragments.
+        let segs = vec![
+            seg("system", 1.0, 2.0, "the true power"),
+            seg("system", 2.0, 3.0, "move is not in saying"),
+            seg("system", 3.0, 4.0, "something real quick"),
+            seg("mic", 1.2, 4.2, "the true power move is not in saying something real quick"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert_eq!(drops, vec![3], "long mic should match union of short system");
+    }
+
+    #[test]
+    fn dedup_handles_fragmented_mic_segments() {
+        // Long system utterance covering several short mic fragments.
+        let segs = vec![
+            seg("system", 1.0, 5.0, "when somebody jabs you typically want to jab back at them"),
+            seg("mic", 1.5, 2.0, "when somebody jabs"),
+            seg("mic", 2.5, 3.5, "you typically want to jab back"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert!(drops.contains(&1) && drops.contains(&2), "both mic fragments should be dropped, got {:?}", drops);
+    }
+
+    #[test]
+    fn dedup_keeps_short_unrelated_mic() {
+        let segs = vec![
+            seg("system", 1.0, 5.0, "the speaker is discussing a long topic about something unrelated"),
+            seg("mic", 2.0, 2.5, "what time is it"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert!(drops.is_empty(), "short distinct mic must not be dropped, got {:?}", drops);
+    }
+
+    #[test]
+    fn dedup_keeps_mic_outside_window() {
+        let segs = vec![
+            seg("system", 1.0, 3.0, "apple banana cherry"),
+            seg("mic", 10.0, 12.0, "apple banana cherry"),
+        ];
+        let drops = compute_mic_echo_dups(&segs);
+        assert!(drops.is_empty(), "mic far from system in time must not be dropped, got {:?}", drops);
     }
 }
