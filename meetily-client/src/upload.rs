@@ -40,7 +40,10 @@ pub async fn create_meeting(server_url: &str, title: &str, client_id: &str) -> R
         .map_err(|e| anyhow!("Failed to connect to server at {}: {}", url, e))?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("Server returned {} when creating meeting", response.status()));
+        return Err(anyhow!(
+            "Server returned {} when creating meeting",
+            response.status()
+        ));
     }
 
     let body: CreateMeetingResponse = response.json().await?;
@@ -78,7 +81,11 @@ pub async fn upload_transcript(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Server returned {} uploading transcript: {}", status, body));
+        return Err(anyhow!(
+            "Server returned {} uploading transcript: {}",
+            status,
+            body
+        ));
     }
 
     log::info!("Uploaded {} segments to server", segments.len());
@@ -95,7 +102,11 @@ pub async fn end_meeting(server_url: &str, meeting_id: &str) -> Result<()> {
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            Err(anyhow!("Server returned {} ending meeting: {}", status, body))
+            Err(anyhow!(
+                "Server returned {} ending meeting: {}",
+                status,
+                body
+            ))
         }
         Err(e) => Err(anyhow!("Failed to end meeting: {}", e)),
     }
@@ -110,6 +121,9 @@ pub async fn trigger_summarize(server_url: &str, meeting_id: &str) -> Result<()>
         log::info!("Summarization triggered for meeting {}", meeting_id);
         Ok(())
     } else {
-        Err(anyhow!("Failed to trigger summarize: {}", response.status()))
+        Err(anyhow!(
+            "Failed to trigger summarize: {}",
+            response.status()
+        ))
     }
 }
