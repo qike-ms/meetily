@@ -31,9 +31,10 @@ impl BackendArg {
 
     /// Per-platform default backend.
     ///
-    /// macOS (with the `coreaudio` feature compiled in, which is the default
-    /// for this crate): CoreAudio Tap — no third-party audio driver required
-    /// on macOS 14.2+. Other platforms / feature-disabled builds: cpal.
+    /// macOS with the `coreaudio` feature compiled in: CoreAudio Tap — no
+    /// third-party audio driver required on macOS 14.2+. Default builds keep
+    /// the feature off so Command Line Tools-only machines can compile; those
+    /// builds, plus other platforms, default to cpal.
     fn platform_default() -> Self {
         #[cfg(all(target_os = "macos", feature = "coreaudio"))]
         {
@@ -77,15 +78,17 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         streaming: bool,
 
-        /// System-audio capture backend. On macOS 14.2+ (with the `coreaudio`
-        /// feature, on by default) this defaults to `coreaudio` — Apple's
-        /// native Core Audio Tap, no third-party drivers required and
-        /// `--system` is ignored (taps the default output mix). Set
-        /// `--backend cpal` to use the legacy cross-platform cpal
-        /// default-output loopback path (requires BlackHole / Multi-Output
-        /// Device on macOS, and uses the device named by `--system`).
-        /// On non-macOS platforms the default is `cpal`. Batch mode
-        /// (`--streaming false`) always uses cpal regardless of this flag.
+        /// System-audio capture backend. Default builds use `cpal`. On macOS
+        /// builds compiled with `--features coreaudio`, the default becomes
+        /// `coreaudio` — Apple's native Core Audio Tap, no third-party drivers
+        /// required and `--system` is ignored (taps the default output mix).
+        /// The `coreaudio` feature requires full Xcode at build time because
+        /// its cidre dependency invokes xcodebuild. Set `--backend cpal` to use
+        /// the legacy cross-platform cpal default-output loopback path
+        /// (requires BlackHole / Multi-Output Device on macOS, and uses the
+        /// device named by `--system`). On non-macOS platforms the default is
+        /// `cpal`. Batch mode (`--streaming false`) always uses cpal regardless
+        /// of this flag.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
 

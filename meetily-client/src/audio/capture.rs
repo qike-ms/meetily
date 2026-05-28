@@ -371,9 +371,9 @@ pub fn record_streaming(
 /// Start a CoreAudio Tap (macOS 14.2+) system capture and forward its samples
 /// into a `RawAudioMessage` channel matching the cpal-streaming-capture shape.
 ///
-/// The `coreaudio` Cargo feature on `meetily-audio` must be enabled (it is by
-/// default for macOS builds of this crate via the `coreaudio` feature on
-/// `meetily-client`). Returns an error on non-macOS platforms.
+/// The `coreaudio` Cargo feature on `meetily-audio` must be enabled via the
+/// `coreaudio` feature on `meetily-client` (requires full Xcode because cidre
+/// invokes xcodebuild). Returns an error on non-macOS platforms.
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
 fn start_streaming_capture_coreaudio(
 ) -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {

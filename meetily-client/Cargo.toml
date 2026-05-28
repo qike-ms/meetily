@@ -4,13 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["coreaudio", "aec"]
+default = ["aec"]
 # Enable Apple Core Audio Tap system-audio capture (macOS 14.2+).
-# The feature is on by default to keep `meetily-client record --backend coreaudio`
-# discoverable on macOS without needing extra Cargo flags. The cidre native
-# code only compiles when target_os = "macos" (gated inside meetily-audio);
-# on Linux/Windows this just adds small pure-Rust optional deps
-# (futures-util, ringbuf).
+# Requires full Xcode because cidre builds native helper code with xcodebuild;
+# Command Line Tools-only machines can still build the default cpal/AEC client.
+# Enable explicitly with `--features coreaudio` on macOS machines that have full
+# Xcode selected via xcode-select.
 coreaudio = ["meetily-audio/coreaudio", "dep:futures-util"]
 # Enable WebRTC AEC3 (sonora-aec3, pure-Rust). On by default; `--no-aec`
 # at the CLI bypasses it at runtime. See per-source-pipeline-design v3.2 §3.

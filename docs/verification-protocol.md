@@ -37,8 +37,10 @@ cd ~/git/meetily
 ssh -fN -o ServerAliveInterval=30 -L 5167:localhost:5167 m1 || true
 curl -sf http://localhost:5167/health   # expect 200
 
-# 4. CLI release build (compiles all default features: coreaudio + aec)
-cargo build -p meetily-client --release
+# 4. CLI release build. The default build compiles cpal + AEC and only needs
+#    Xcode Command Line Tools. Add `--features coreaudio` on macOS hosts with
+#    full Xcode selected when verifying the native Core Audio Tap path.
+cargo build -p meetily-client --release --features coreaudio
 ./target/release/meetily-client devices    # confirm mic + system devices listed
 ```
 
@@ -62,10 +64,11 @@ Hit **play** then immediately speak into the mic for ~10 s of the 30 s window: "
 ### Run
 
 ```bash
-# A4: --backend defaults to coreaudio on macOS, no flag needed.
+# A4/CoreAudio verification: explicitly select the feature-gated CoreAudio backend.
 ./target/release/meetily-client record \
   --server http://localhost:5167 \
   --title "verify-A3-A4-coreaudio-$(date +%Y%m%d-%H%M%S)" \
+  --backend coreaudio \
   --model large-v3-turbo
 ```
 
