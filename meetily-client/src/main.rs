@@ -8,9 +8,7 @@ use meetily_client::transcribe::{
     download_model, get_model_path, load_model, merge_segments, transcribe_chunk, transcribe_wav,
     TranscriptSegment,
 };
-use meetily_client::upload::{
-    create_meeting, end_meeting, trigger_summarize, upload_transcript,
-};
+use meetily_client::upload::{create_meeting, end_meeting, trigger_summarize, upload_transcript};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -33,9 +31,10 @@ impl BackendArg {
 
     /// Per-platform default backend.
     ///
-    /// macOS (with the `coreaudio` feature compiled in, which is the default
-    /// for this crate): CoreAudio Tap — no third-party audio driver required
-    /// on macOS 14.2+. Other platforms / feature-disabled builds: cpal.
+    /// macOS with the `coreaudio` feature compiled in: CoreAudio Tap — no
+    /// third-party audio driver required on macOS 14.2+. Default builds keep
+    /// the feature off so Command Line Tools-only machines can compile; those
+    /// builds, plus other platforms, default to cpal.
     fn platform_default() -> Self {
         #[cfg(all(target_os = "macos", feature = "coreaudio"))]
         {
@@ -79,15 +78,17 @@ enum Commands {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         streaming: bool,
 
-        /// System-audio capture backend. On macOS 14.2+ (with the `coreaudio`
-        /// feature, on by default) this defaults to `coreaudio` — Apple's
-        /// native Core Audio Tap, no third-party drivers required and
-        /// `--system` is ignored (taps the default output mix). Set
-        /// `--backend cpal` to use the legacy cross-platform cpal
-        /// default-output loopback path (requires BlackHole / Multi-Output
-        /// Device on macOS, and uses the device named by `--system`).
-        /// On non-macOS platforms the default is `cpal`. Batch mode
-        /// (`--streaming false`) always uses cpal regardless of this flag.
+        /// System-audio capture backend. Default builds use `cpal`. On macOS
+        /// builds compiled with `--features coreaudio`, the default becomes
+        /// `coreaudio` — Apple's native Core Audio Tap, no third-party drivers
+        /// required and `--system` is ignored (taps the default output mix).
+        /// The `coreaudio` feature requires full Xcode at build time because
+        /// its cidre dependency invokes xcodebuild. Set `--backend cpal` to use
+        /// the legacy cross-platform cpal default-output loopback path
+        /// (requires BlackHole / Multi-Output Device on macOS, and uses the
+        /// device named by `--system`). On non-macOS platforms the default is
+        /// `cpal`. Batch mode (`--streaming false`) always uses cpal regardless
+        /// of this flag.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
 
@@ -164,7 +165,14 @@ async fn main() -> Result<()> {
             println!("Model loaded.");
 
             let segments = if streaming {
-                run_streaming_session(mic, system, resolved_backend.into_system_backend(), !no_aec, whisper.clone()).await?
+                run_streaming_session(
+                    mic,
+                    system,
+                    resolved_backend.into_system_backend(),
+                    !no_aec,
+                    whisper.clone(),
+                )
+                .await?
             } else {
                 run_batch_session(mic, system, &whisper).await?
             };
@@ -221,7 +229,10 @@ async fn run_streaming_session(
     // Bind the source-name string up front so the println! borrow doesn't
     // conflict with the move into record_streaming below.
     let system_label = if system_active {
-        system.as_deref().unwrap_or("default-output-mix").to_string()
+        system
+            .as_deref()
+            .unwrap_or("default-output-mix")
+            .to_string()
     } else {
         "DISABLED (no system audio)".to_string()
     };
@@ -235,7 +246,8 @@ async fn run_streaming_session(
     );
     println!(">>> Press Ctrl+C to stop. <<<\n");
 
-    let (mut handle, mut rx) = record_streaming(mic, system, system_backend, enable_aec).context("failed to start streaming capture")?;
+    let (mut handle, mut rx) = record_streaming(mic, system, system_backend, enable_aec)
+        .context("failed to start streaming capture")?;
     let recording_started = Instant::now();
     let stop = CancellationToken::new();
     let stop_for_signal = stop.clone();
@@ -268,7 +280,8 @@ async fn run_streaming_session(
     });
 
     let mut all_segments: Vec<TranscriptSegment> = Vec::new();
-    let mut transcribe_tasks: Vec<tokio::task::JoinHandle<Result<Vec<TranscriptSegment>>>> = Vec::new();
+    let mut transcribe_tasks: Vec<tokio::task::JoinHandle<Result<Vec<TranscriptSegment>>>> =
+        Vec::new();
     let mut mic_count = 0usize;
     let mut sys_count = 0usize;
     let mut system_silence_warned = false;
@@ -326,7 +339,9 @@ async fn run_streaming_session(
 
     // Stop capture streams (closes raw channel -> pump threads will finish
     // their loop and drop the utterance sender once their buffer drains).
-    handle.request_stop().context("failed to request stop on streaming capture")?;
+    handle
+        .request_stop()
+        .context("failed to request stop on streaming capture")?;
 
     // Drain remaining utterances so pumps can complete their blocking_send
     // calls and exit cleanly. rx returns None when all senders are dropped.
@@ -414,12 +429,17 @@ async fn run_streaming_session(
     let original_n = all_segments.len();
     let halluc_indices = compute_whisper_hallucinations(&all_segments);
     if !halluc_indices.is_empty() {
-        let halluc_set: std::collections::HashSet<usize> =
-            halluc_indices.iter().copied().collect();
+        let halluc_set: std::collections::HashSet<usize> = halluc_indices.iter().copied().collect();
         all_segments = all_segments
             .into_iter()
             .enumerate()
-            .filter_map(|(i, s)| if halluc_set.contains(&i) { None } else { Some(s) })
+            .filter_map(|(i, s)| {
+                if halluc_set.contains(&i) {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
             .collect();
         println!(
             ">>> dropped {} suspected Whisper hallucination(s) on the mic stream",
@@ -460,8 +480,7 @@ async fn run_streaming_session(
     let after_token_n = all_segments.len();
     let overlap_indices = compute_mic_time_overlap_with_system(&all_segments);
     if !overlap_indices.is_empty() {
-        let drop_set: std::collections::HashSet<usize> =
-            overlap_indices.iter().copied().collect();
+        let drop_set: std::collections::HashSet<usize> = overlap_indices.iter().copied().collect();
         all_segments = all_segments
             .into_iter()
             .enumerate()
@@ -475,7 +494,10 @@ async fn run_streaming_session(
     let _ = original_n;
 
     if !all_segments.is_empty() {
-        println!("\n=== Final Transcript ({} segments) ===", all_segments.len());
+        println!(
+            "\n=== Final Transcript ({} segments) ===",
+            all_segments.len()
+        );
         for seg in &all_segments {
             let label = if seg.source == "mic" { "YOU" } else { "THEM" };
             println!("  [{}] [{}] {}", seg.timestamp, label, seg.text);
@@ -799,7 +821,10 @@ async fn run_batch_session(
 
     let segments = merge_segments(mic_segments, system_segments);
     if !segments.is_empty() {
-        println!("\n=== Combined Transcript ({} segments) ===", segments.len());
+        println!(
+            "\n=== Combined Transcript ({} segments) ===",
+            segments.len()
+        );
         for seg in &segments {
             let label = if seg.source == "mic" { "YOU" } else { "THEM" };
             println!("  [{}] [{}] {}", seg.timestamp, label, seg.text);
@@ -841,7 +866,12 @@ mod tests {
     #[test]
     fn dedup_drops_mic_echo_of_system() {
         let segs = vec![
-            seg("system", 1.0, 4.0, "first test sentence apple banana cherry"),
+            seg(
+                "system",
+                1.0,
+                4.0,
+                "first test sentence apple banana cherry",
+            ),
             seg("mic", 1.5, 4.5, "first test sentence apple banana cherry"),
         ];
         let drops = compute_mic_echo_dups(&segs);
@@ -851,11 +881,25 @@ mod tests {
     #[test]
     fn dedup_keeps_distinct_user_speech_during_system() {
         let segs = vec![
-            seg("system", 1.0, 5.0, "the system talks about apples bananas and cherries"),
-            seg("mic", 2.0, 4.0, "i am the user discussing quantum mechanics relativity"),
+            seg(
+                "system",
+                1.0,
+                5.0,
+                "the system talks about apples bananas and cherries",
+            ),
+            seg(
+                "mic",
+                2.0,
+                4.0,
+                "i am the user discussing quantum mechanics relativity",
+            ),
         ];
         let drops = compute_mic_echo_dups(&segs);
-        assert!(drops.is_empty(), "distinct user speech must not be dropped, got {:?}", drops);
+        assert!(
+            drops.is_empty(),
+            "distinct user speech must not be dropped, got {:?}",
+            drops
+        );
     }
 
     #[test]
@@ -865,32 +909,59 @@ mod tests {
             seg("system", 1.0, 2.0, "the true power"),
             seg("system", 2.0, 3.0, "move is not in saying"),
             seg("system", 3.0, 4.0, "something real quick"),
-            seg("mic", 1.2, 4.2, "the true power move is not in saying something real quick"),
+            seg(
+                "mic",
+                1.2,
+                4.2,
+                "the true power move is not in saying something real quick",
+            ),
         ];
         let drops = compute_mic_echo_dups(&segs);
-        assert_eq!(drops, vec![3], "long mic should match union of short system");
+        assert_eq!(
+            drops,
+            vec![3],
+            "long mic should match union of short system"
+        );
     }
 
     #[test]
     fn dedup_handles_fragmented_mic_segments() {
         // Long system utterance covering several short mic fragments.
         let segs = vec![
-            seg("system", 1.0, 5.0, "when somebody jabs you typically want to jab back at them"),
+            seg(
+                "system",
+                1.0,
+                5.0,
+                "when somebody jabs you typically want to jab back at them",
+            ),
             seg("mic", 1.5, 2.0, "when somebody jabs"),
             seg("mic", 2.5, 3.5, "you typically want to jab back"),
         ];
         let drops = compute_mic_echo_dups(&segs);
-        assert!(drops.contains(&1) && drops.contains(&2), "both mic fragments should be dropped, got {:?}", drops);
+        assert!(
+            drops.contains(&1) && drops.contains(&2),
+            "both mic fragments should be dropped, got {:?}",
+            drops
+        );
     }
 
     #[test]
     fn dedup_keeps_short_unrelated_mic() {
         let segs = vec![
-            seg("system", 1.0, 5.0, "the speaker is discussing a long topic about something unrelated"),
+            seg(
+                "system",
+                1.0,
+                5.0,
+                "the speaker is discussing a long topic about something unrelated",
+            ),
             seg("mic", 2.0, 2.5, "what time is it"),
         ];
         let drops = compute_mic_echo_dups(&segs);
-        assert!(drops.is_empty(), "short distinct mic must not be dropped, got {:?}", drops);
+        assert!(
+            drops.is_empty(),
+            "short distinct mic must not be dropped, got {:?}",
+            drops
+        );
     }
 
     #[test]
@@ -900,7 +971,11 @@ mod tests {
             seg("mic", 10.0, 12.0, "apple banana cherry"),
         ];
         let drops = compute_mic_echo_dups(&segs);
-        assert!(drops.is_empty(), "mic far from system in time must not be dropped, got {:?}", drops);
+        assert!(
+            drops.is_empty(),
+            "mic far from system in time must not be dropped, got {:?}",
+            drops
+        );
     }
 
     #[test]
@@ -909,10 +984,19 @@ mod tests {
         // diverge enough that token dedup misses it. Pure timestamp catches.
         let segs = vec![
             seg("system", 5.0, 8.0, "alpha bravo charlie delta echo"),
-            seg("mic", 5.2, 7.8, "totally different words that whisper invented"),
+            seg(
+                "mic",
+                5.2,
+                7.8,
+                "totally different words that whisper invented",
+            ),
         ];
         let drops = compute_mic_time_overlap_with_system(&segs);
-        assert_eq!(drops, vec![1], "mic fully under system must be dropped by time-overlap");
+        assert_eq!(
+            drops,
+            vec![1],
+            "mic fully under system must be dropped by time-overlap"
+        );
     }
 
     #[test]
@@ -922,7 +1006,10 @@ mod tests {
             seg("mic", 10.0, 12.0, "user speech while system silent"),
         ];
         let drops = compute_mic_time_overlap_with_system(&segs);
-        assert!(drops.is_empty(), "mic outside system intervals must be kept");
+        assert!(
+            drops.is_empty(),
+            "mic outside system intervals must be kept"
+        );
     }
 
     #[test]
@@ -930,10 +1017,19 @@ mod tests {
         // Mic 4s long, only 1s overlaps system → 25% overlap, below 40% bar.
         let segs = vec![
             seg("system", 5.0, 6.0, "brief system"),
-            seg("mic", 5.0, 9.0, "long user speech that ran into a brief system burst"),
+            seg(
+                "mic",
+                5.0,
+                9.0,
+                "long user speech that ran into a brief system burst",
+            ),
         ];
         let drops = compute_mic_time_overlap_with_system(&segs);
-        assert!(drops.is_empty(), "mic with <40% overlap must be kept, got {:?}", drops);
+        assert!(
+            drops.is_empty(),
+            "mic with <40% overlap must be kept, got {:?}",
+            drops
+        );
     }
 
     #[test]
@@ -946,7 +1042,11 @@ mod tests {
             seg("mic", 5.0, 7.5, "echo of both system fragments"),
         ];
         let drops = compute_mic_time_overlap_with_system(&segs);
-        assert_eq!(drops, vec![2], "mic covered by union of two system segs must be dropped");
+        assert_eq!(
+            drops,
+            vec![2],
+            "mic covered by union of two system segs must be dropped"
+        );
     }
 
     #[test]
@@ -957,6 +1057,10 @@ mod tests {
             seg("mic", 2.0, 2.05, ""),
         ];
         let drops = compute_mic_time_overlap_with_system(&segs);
-        assert!(drops.is_empty(), "sub-100ms mic blip must be ignored, got {:?}", drops);
+        assert!(
+            drops.is_empty(),
+            "sub-100ms mic blip must be ignored, got {:?}",
+            drops
+        );
     }
 }

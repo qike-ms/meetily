@@ -13,6 +13,11 @@ use tokio_util::sync::CancellationToken;
 use meetily_audio::resample::Resampler16k;
 use meetily_audio::vad::{Utterance, Vad};
 
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command, Stdio};
+
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_CHANNEL_CAPACITY: usize = 16_384;
 /// Tokio mpsc capacity for streaming utterances (each is small metadata + ~few sec of f32).
@@ -142,6 +147,10 @@ struct ActiveCapture {
     /// `stop()` flips this flag and joins the thread.
     core_audio_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     core_audio_thread: Option<JoinHandle<Result<()>>>,
+    #[cfg(target_os = "linux")]
+    pulse_child: Option<Child>,
+    #[cfg(target_os = "linux")]
+    pulse_thread: Option<JoinHandle<Result<()>>>,
 }
 
 impl ActiveCapture {
@@ -174,6 +183,14 @@ impl ActiveCapture {
             // unbounded send pattern.
             drop(sender);
         }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(child) = self.pulse_child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.pulse_child.take();
+        }
         if let Some(writer_thread) = self.writer_thread.take() {
             writer_thread
                 .join()
@@ -182,6 +199,13 @@ impl ActiveCapture {
         if let Some(t) = self.core_audio_thread.take() {
             t.join()
                 .map_err(|_| anyhow!("CoreAudio forwarder thread panicked"))??;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(t) = self.pulse_thread.take() {
+                t.join()
+                    .map_err(|_| anyhow!("PulseAudio monitor thread panicked"))??;
+            }
         }
         Ok(())
     }
@@ -243,7 +267,10 @@ pub fn record_streaming(
     // Build the AEC roles. With AEC enabled and a system source available,
     // we set up a render-tee channel. Without either, both pumps run with
     // AecRole::None.
-    let want_system = !matches!((system_device.as_deref(), system_backend), (None, SystemBackend::Cpal));
+    let want_system = !matches!(
+        (system_device.as_deref(), system_backend),
+        (None, SystemBackend::Cpal)
+    );
     #[cfg(feature = "aec")]
     let (mic_role, system_role) = if enable_aec && want_system {
         // Bounded render tee. Capacity sized to ~2 s of 30 ms frames at
@@ -262,8 +289,15 @@ pub fn record_streaming(
         // (verified via DIAG self-test 2026-05-12).
         aec.set_delay_hint_ms(100);
         (
-            AecRole::Mic { aec, render_rx, render_drops: render_drops.clone() },
-            AecRole::System { render_tx, render_drops },
+            AecRole::Mic {
+                aec,
+                render_rx,
+                render_drops: render_drops.clone(),
+            },
+            AecRole::System {
+                render_tx,
+                render_drops,
+            },
         )
     } else {
         (AecRole::None, AecRole::None)
@@ -293,7 +327,7 @@ pub fn record_streaming(
         }
         (_, SystemBackend::Cpal) => {
             let (cap, raw_rx, rate, channels) =
-                start_streaming_capture(system_device.as_deref(), false)
+                start_streaming_system_capture(system_device.as_deref())
                     .context("failed to start streaming system capture")?;
             cap.play().context("failed to play system stream")?;
             let pump = spawn_pump_thread(
@@ -309,7 +343,8 @@ pub fn record_streaming(
         (_, SystemBackend::CoreAudio) => {
             let (cap, raw_rx, rate, channels) = start_streaming_capture_coreaudio()
                 .context("failed to start CoreAudio system capture")?;
-            cap.play().context("failed to play CoreAudio system stream")?;
+            cap.play()
+                .context("failed to play CoreAudio system stream")?;
             let pump = spawn_pump_thread(
                 StreamSource::System,
                 raw_rx,
@@ -336,12 +371,12 @@ pub fn record_streaming(
 /// Start a CoreAudio Tap (macOS 14.2+) system capture and forward its samples
 /// into a `RawAudioMessage` channel matching the cpal-streaming-capture shape.
 ///
-/// The `coreaudio` Cargo feature on `meetily-audio` must be enabled (it is by
-/// default for macOS builds of this crate via the `coreaudio` feature on
-/// `meetily-client`). Returns an error on non-macOS platforms.
+/// The `coreaudio` Cargo feature on `meetily-audio` must be enabled via the
+/// `coreaudio` feature on `meetily-client` (requires full Xcode because cidre
+/// invokes xcodebuild). Returns an error on non-macOS platforms.
 #[cfg(all(target_os = "macos", feature = "coreaudio"))]
-fn start_streaming_capture_coreaudio()
-    -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+fn start_streaming_capture_coreaudio(
+) -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
     use futures_util::StreamExt;
 
     let capture = meetily_audio::capture::core_audio::CoreAudioCapture::new()
@@ -383,25 +418,19 @@ fn start_streaming_capture_coreaudio()
 
             rt.block_on(async move {
                 while !stop_flag_thread.load(std::sync::atomic::Ordering::Acquire) {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        stream.next(),
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                        .await
                     {
                         Ok(Some(sample)) => {
                             buf.push(sample);
                             if buf.len() >= BATCH {
-                                let chunk = std::mem::replace(
-                                    &mut buf,
-                                    Vec::with_capacity(BATCH),
-                                );
-                                if let Err(e) = raw_tx_for_thread
-                                    .try_send(RawAudioMessage(chunk))
-                                {
+                                let chunk = std::mem::replace(&mut buf, Vec::with_capacity(BATCH));
+                                if let Err(e) = raw_tx_for_thread.try_send(RawAudioMessage(chunk)) {
                                     match e {
                                         TrySendError::Full(_) => {
-                                            log::warn!("CoreAudio fwd: pump backpressure, dropping batch");
+                                            log::warn!(
+                                                "CoreAudio fwd: pump backpressure, dropping batch"
+                                            );
                                         }
                                         TrySendError::Disconnected(_) => {
                                             log::debug!("CoreAudio fwd: pump dropped, exiting");
@@ -436,6 +465,10 @@ fn start_streaming_capture_coreaudio()
             raw_sender: Some(raw_tx),
             core_audio_stop: Some(stop_flag),
             core_audio_thread: Some(thread),
+            #[cfg(target_os = "linux")]
+            pulse_child: None,
+            #[cfg(target_os = "linux")]
+            pulse_thread: None,
         },
         raw_rx,
         input_rate,
@@ -444,8 +477,8 @@ fn start_streaming_capture_coreaudio()
 }
 
 #[cfg(not(all(target_os = "macos", feature = "coreaudio")))]
-fn start_streaming_capture_coreaudio()
-    -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+fn start_streaming_capture_coreaudio(
+) -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
     Err(anyhow!(
         "CoreAudio backend is only available on macOS with the `coreaudio` feature enabled"
     ))
@@ -488,8 +521,8 @@ fn spawn_pump_thread(
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let mut resampler = Resampler16k::new(input_rate, input_channels)
         .with_context(|| format!("failed to init resampler for {}", source.as_str()))?;
-    let mut vad = Vad::new()
-        .with_context(|| format!("failed to init VAD for {}", source.as_str()))?;
+    let mut vad =
+        Vad::new().with_context(|| format!("failed to init VAD for {}", source.as_str()))?;
 
     // Post-AEC accumulator: AEC operates in 4 ms / 64-sample blocks while
     // VAD wants exactly VAD_FRAME_SAMPLES (480 = 30 ms) per call. AEC
@@ -508,9 +541,9 @@ fn spawn_pump_thread(
 
             // Drain raw audio until the producer (cpal stream) is dropped.
             while let Ok(RawAudioMessage(samples)) = raw_rx.recv() {
-                let frames = resampler.push(&samples).with_context(|| {
-                    format!("resampler failed for {}", source.as_str())
-                })?;
+                let frames = resampler
+                    .push(&samples)
+                    .with_context(|| format!("resampler failed for {}", source.as_str()))?;
                 for frame in frames {
                     // AEC wiring (feature-gated):
                     //  - Mic: drain any pending render-tee chunks into the
@@ -523,14 +556,16 @@ fn spawn_pump_thread(
                     #[cfg(feature = "aec")]
                     {
                         match &mut aec_role {
-                            AecRole::Mic { aec, render_rx, render_drops } => {
+                            AecRole::Mic {
+                                aec,
+                                render_rx,
+                                render_drops,
+                            } => {
                                 while let Ok(render_chunk) = render_rx.try_recv() {
                                     aec.ingest_render(&render_chunk);
                                 }
-                                let drops = render_drops.swap(
-                                    0,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                                let drops =
+                                    render_drops.swap(0, std::sync::atomic::Ordering::Relaxed);
                                 for _ in 0..drops {
                                     aec.record_render_drop();
                                 }
@@ -548,13 +583,14 @@ fn spawn_pump_thread(
                                 }
                                 processed_frame = out;
                             }
-                            AecRole::System { render_tx, render_drops } => {
+                            AecRole::System {
+                                render_tx,
+                                render_drops,
+                            } => {
                                 if let Err(e) = render_tx.try_send(frame.clone()) {
                                     if matches!(e, TrySendError::Full(_)) {
-                                        render_drops.fetch_add(
-                                            1,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
+                                        render_drops
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     // Disconnected = mic pump exited; we
                                     // continue running our own VAD/Whisper path
@@ -589,10 +625,7 @@ fn spawn_pump_thread(
                         for utterance in utts {
                             let chunk = StreamingChunk { source, utterance };
                             if utt_tx.blocking_send(chunk).is_err() {
-                                log::debug!(
-                                    "{} pump: receiver dropped, exiting",
-                                    source.as_str()
-                                );
+                                log::debug!("{} pump: receiver dropped, exiting", source.as_str());
                                 return Ok(());
                             }
                         }
@@ -606,9 +639,9 @@ fn spawn_pump_thread(
             // so the VAD emits SpeechEnd for any in-progress utterance.
             if !vad_acc.is_empty() {
                 vad_acc.resize(meetily_audio::vad::VAD_FRAME_SAMPLES, 0.0);
-                let utts = vad
-                    .process_frame(&vad_acc)
-                    .with_context(|| format!("vad final partial flush failed for {}", source.as_str()))?;
+                let utts = vad.process_frame(&vad_acc).with_context(|| {
+                    format!("vad final partial flush failed for {}", source.as_str())
+                })?;
                 for utterance in utts {
                     let chunk = StreamingChunk { source, utterance };
                     if utt_tx.blocking_send(chunk).is_err() {
@@ -618,7 +651,8 @@ fn spawn_pump_thread(
                 vad_acc.clear();
             }
             let silence_frame = vec![0.0f32; meetily_audio::vad::VAD_FRAME_SAMPLES];
-            let flush_frames = (meetily_audio::vad::VAD_SAMPLE_RATE / meetily_audio::vad::VAD_FRAME_SAMPLES) + 1;
+            let flush_frames =
+                (meetily_audio::vad::VAD_SAMPLE_RATE / meetily_audio::vad::VAD_FRAME_SAMPLES) + 1;
             for _ in 0..flush_frames {
                 let utts = vad
                     .process_frame(&silence_frame)
@@ -635,7 +669,6 @@ fn spawn_pump_thread(
         .context("failed to spawn pump thread")?;
     Ok(handle)
 }
-
 
 fn start_streaming_capture(
     device_name: Option<&str>,
@@ -661,9 +694,15 @@ fn start_streaming_capture(
     let err_fn = |err| log::error!("audio stream error on streaming capture: {err}");
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_streaming_stream::<f32>(&device, &config, raw_tx.clone(), err_fn),
-        SampleFormat::I16 => build_streaming_stream::<i16>(&device, &config, raw_tx.clone(), err_fn),
-        SampleFormat::U16 => build_streaming_stream::<u16>(&device, &config, raw_tx.clone(), err_fn),
+        SampleFormat::F32 => {
+            build_streaming_stream::<f32>(&device, &config, raw_tx.clone(), err_fn)
+        }
+        SampleFormat::I16 => {
+            build_streaming_stream::<i16>(&device, &config, raw_tx.clone(), err_fn)
+        }
+        SampleFormat::U16 => {
+            build_streaming_stream::<u16>(&device, &config, raw_tx.clone(), err_fn)
+        }
         other => Err(anyhow!("unsupported sample format: {other:?}")),
     }?;
 
@@ -675,11 +714,192 @@ fn start_streaming_capture(
             raw_sender: Some(raw_tx),
             core_audio_stop: None,
             core_audio_thread: None,
+            #[cfg(target_os = "linux")]
+            pulse_child: None,
+            #[cfg(target_os = "linux")]
+            pulse_thread: None,
         },
         raw_rx,
         input_rate,
         input_channels,
     ))
+}
+
+fn start_streaming_system_capture(
+    device_name: Option<&str>,
+) -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+    #[cfg(target_os = "linux")]
+    {
+        match start_streaming_capture_pulse_monitor(device_name) {
+            Ok(capture) => return Ok(capture),
+            Err(err) => {
+                log::warn!(
+                    "PulseAudio/PipeWire monitor capture failed ({err:#}); falling back to cpal output capture"
+                );
+            }
+        }
+    }
+
+    start_streaming_capture(device_name, false)
+}
+
+#[cfg(target_os = "linux")]
+fn start_streaming_capture_pulse_monitor(
+    device_name: Option<&str>,
+) -> Result<(ActiveCapture, Receiver<RawAudioMessage>, u32, u16)> {
+    const PULSE_RATE: u32 = 48_000;
+    const PULSE_CHANNELS: u16 = 2;
+
+    let source = resolve_pulse_monitor_source(device_name)
+        .context("failed to resolve PulseAudio/PipeWire monitor source")?;
+    let (raw_tx, raw_rx) = sync_channel::<RawAudioMessage>(AUDIO_CHANNEL_CAPACITY);
+
+    let mut child = Command::new("parec")
+        .args([
+            "--raw",
+            "--format=float32le",
+            "--rate=48000",
+            "--channels=2",
+            "--device",
+            &source,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn parec for source {source}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("parec stdout was not captured"))?;
+    let raw_tx_for_thread = raw_tx.clone();
+
+    let thread = thread::Builder::new()
+        .name("meetily-pulse-monitor".to_string())
+        .spawn(move || -> Result<()> {
+            let mut bytes = vec![0_u8; 16 * 1024];
+            let mut carry = Vec::<u8>::new();
+
+            loop {
+                let n = stdout
+                    .read(&mut bytes)
+                    .context("failed reading from parec stdout")?;
+                if n == 0 {
+                    break;
+                }
+
+                carry.extend_from_slice(&bytes[..n]);
+                let complete_len = carry.len() - (carry.len() % 4);
+                if complete_len == 0 {
+                    continue;
+                }
+
+                let mut samples = Vec::with_capacity(complete_len / 4);
+                for chunk in carry[..complete_len].chunks_exact(4) {
+                    samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+                carry.drain(..complete_len);
+
+                match raw_tx_for_thread.try_send(RawAudioMessage(samples)) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        log::warn!("pulse monitor raw channel full, dropping samples");
+                    }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+
+            Ok(())
+        })
+        .context("failed to spawn PulseAudio monitor thread")?;
+
+    Ok((
+        ActiveCapture {
+            stream: None,
+            sender: None,
+            writer_thread: None,
+            raw_sender: Some(raw_tx),
+            core_audio_stop: None,
+            core_audio_thread: None,
+            pulse_child: Some(child),
+            pulse_thread: Some(thread),
+        },
+        raw_rx,
+        PULSE_RATE,
+        PULSE_CHANNELS,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_pulse_monitor_source(device_name: Option<&str>) -> Result<String> {
+    let sources = pactl_lines(&["list", "short", "sources"]).unwrap_or_default();
+    let sinks = pactl_lines(&["list", "short", "sinks"]).unwrap_or_default();
+
+    let source_names: Vec<String> = sources
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+    let sink_names: Vec<String> = sinks
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1).map(str::to_string))
+        .collect();
+
+    if let Some(name) = device_name {
+        if source_names.iter().any(|s| s == name) {
+            return Ok(name.to_string());
+        }
+
+        let monitor_name = if name.ends_with(".monitor") {
+            name.to_string()
+        } else {
+            format!("{name}.monitor")
+        };
+        if source_names.iter().any(|s| s == &monitor_name) {
+            return Ok(monitor_name);
+        }
+
+        if name != "default" && name != "pipewire" && sink_names.iter().any(|s| s == name) {
+            return Ok(format!("{name}.monitor"));
+        }
+    }
+
+    let default_sink = pactl_one(&["get-default-sink"])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| sink_names.first().cloned())
+        .ok_or_else(|| anyhow!("no PulseAudio/PipeWire sink found"))?;
+    let default_monitor = format!("{default_sink}.monitor");
+
+    if source_names.iter().any(|s| s == &default_monitor) {
+        Ok(default_monitor)
+    } else {
+        source_names
+            .into_iter()
+            .find(|s| s.ends_with(".monitor"))
+            .ok_or_else(|| anyhow!("no PulseAudio/PipeWire monitor source found"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pactl_one(args: &[&str]) -> Result<String> {
+    let output = Command::new("pactl")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run pactl {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!("pactl {} exited with {}", args.join(" "), output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn pactl_lines(args: &[&str]) -> Result<Vec<String>> {
+    Ok(pactl_one(args)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn build_streaming_stream<T>(
@@ -702,7 +922,10 @@ where
             match sender.try_send(RawAudioMessage(floats)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    log::warn!("streaming raw channel full, dropping {} samples", data.len());
+                    log::warn!(
+                        "streaming raw channel full, dropping {} samples",
+                        data.len()
+                    );
                 }
                 Err(TrySendError::Disconnected(_)) => {}
             }
@@ -752,6 +975,10 @@ fn start_capture_stream(
         raw_sender: None,
         core_audio_stop: None,
         core_audio_thread: None,
+        #[cfg(target_os = "linux")]
+        pulse_child: None,
+        #[cfg(target_os = "linux")]
+        pulse_thread: None,
     })
 }
 

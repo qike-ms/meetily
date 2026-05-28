@@ -95,7 +95,10 @@ async fn main() -> Result<()> {
     let solo_median_ms = solo_ms[solo_ms.len() / 2] as f64;
 
     // Concurrent timing.
-    eprintln!("Concurrent timing: {} tasks via spawn_blocking", N_CONCURRENT);
+    eprintln!(
+        "Concurrent timing: {} tasks via spawn_blocking",
+        N_CONCURRENT
+    );
     let start = Instant::now();
     let mut handles = Vec::with_capacity(N_CONCURRENT);
     for i in 0..N_CONCURRENT {

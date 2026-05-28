@@ -259,7 +259,7 @@ PR body should include:
 ### A4 (#55) — Default + drop BlackHole from docs
 
 **Approach:**
-1. Make `--backend coreaudio` the macOS default in `meetily-client` CLI parser. cpal still selectable via `--backend cpal`.
+1. Make `--backend coreaudio` the macOS default only for `meetily-client` builds compiled with `--features coreaudio`; default release builds keep cpal so Command Line Tools-only machines can compile. cpal remains selectable via `--backend cpal`.
 2. README diff: remove BlackHole installation, Audio MIDI Setup steps, Multi-Output Device instructions for macOS.
 3. Add a paragraph: "macOS 14.2+: system audio captured via Apple's native Core Audio Tap. No third-party drivers required."
 
